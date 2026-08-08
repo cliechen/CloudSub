@@ -53,8 +53,8 @@
       ```
       vless://YOUR-NODE-LINK-HERE
       vmess://YOUR-NODE-LINK-HERE
-      https://sub.example.com/auto
-      https://hy2sub.pages.dev
+      示例订阅源：/auto
+      示例订阅源：hy2sub.pages.dev
       ```
 
    > 订阅源支持多种格式：Clash YAML、sing-box / v2ray JSON、Surge / Loon / Quantumult X 配置、SS JSON、Clash JSON、base64 与明文节点链接，均可直接填入。
@@ -64,7 +64,7 @@
 ### 1. 部署 Cloudflare Worker：
 
    - 在 Cloudflare Worker 控制台中创建一个新的 Worker。
-   - 将 [_worker.js](https://github.com/YOUR-USERNAME/CloudSub/blob/main/_worker.js)  的内容粘贴到 Worker 编辑器中。
+   - 将 [_worker.js](_worker.js) 的内容粘贴到 Worker 编辑器中。
 
 
 ### 2. 修改 订阅入口 ：
@@ -94,8 +94,8 @@
       ```
       vless://YOUR-NODE-LINK-HERE
       vmess://YOUR-NODE-LINK-HERE
-      https://sub.example.com/auto
-      https://hy2sub.pages.dev
+      示例订阅源：/auto
+      示例订阅源：hy2sub.pages.dev
       ```
 
    > 订阅源支持多种格式：Clash YAML、sing-box / v2ray JSON、Surge / Loon / Quantumult X 配置、SS JSON、Clash JSON、base64 与明文节点链接，均可直接填入。
@@ -106,8 +106,8 @@
 | TOKEN | `auto` | ✅ | 仅用于管理配置页面的入口 Token，例如：`/auto` | 
 | SUBTOKEN | `YOUR-UUID-HERE` | ✅ | 客户端订阅 Token，必须为 UUID，例如：`/sub?token=YOUR-UUID-HERE`。也可使用变量名 `SUBUUID` | 
 | KV | （KV 命名空间绑定） | ✅（推荐） | 绑定**变量名称**为 `KV` 的 KV 命名空间，用于保存节点/订阅链接、协议过滤配置与分流规则缓存 | 
-| LINK | `vless://...`,`vmess://...`,`https://sub...` | ❌ | 未绑定 KV 时使用：可同时放入多个节点链接与多个订阅链接，链接之间用换行做间隔 | 
-| LINKSUB | `https://sub...` | ❌ | 未绑定 KV 时使用：仅填写订阅链接（机场/自建聚合订阅），换行分隔 | 
+| LINK | `vless://...`,`vmess://...`,`订阅链接...` | ❌ | 未绑定 KV 时使用：可同时放入多个节点链接与多个订阅链接，链接之间用换行做间隔 | 
+| LINKSUB | `https://订阅链接...` | ❌ | 未绑定 KV 时使用：仅填写订阅链接（机场/自建聚合订阅），换行分隔 | 
 | PROTOCOL | `vmess,vless,ss` | ❌ | 仅保留指定协议的节点；也可在管理页勾选（存入 KV 的 `PROTOCOL.txt`） | 
 | WARP | `warp://...` 或任意节点链接 | ❌ | 追加 WARP 节点到聚合订阅中 | 
 | SUBNAME | `CloudSub` | ❌ | 订阅名称 | 
