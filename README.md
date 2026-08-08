@@ -19,20 +19,13 @@
 7. **按协议过滤节点：** 管理页可勾选仅保留指定协议（vmess / vless / ss / ssr / trojan / hysteria2 / tuic / wireguard / anytls 等）；
 8. **更多功能等待发掘...**
 
-## 🎬 视频教程
-- **[自建订阅！CloudSub 教你如何将多节点多订阅汇聚合并为一个订阅！](https://youtu.be/w6rRY4FDd58)**
-
-## 🤝 社区支持
-- Telegram 交流群: [YOUR-TELEGRAM](https://t.me/YOUR-TELEGRAM)
-- 感谢 [Alice Networks](https://example.com/) 提供的云服务器支持
-
 ## 📦 Pages 部署方法
 
 <details>
 <summary><code><strong>「 Pages GitHub 部署文字教程 」</strong></code></summary>
 
 ### 1. 部署 Cloudflare Pages：
-   - 在 Github 上先 Fork 本项目，并点上 Star !!!
+   - 在 Github 上先 Fork 本项目
    - 在 Cloudflare Pages 控制台中选择 `连接到 Git`后，选中 `CloudSub`项目后点击 `开始设置`。
 
 ### 2. 给 Pages绑定 自定义域：
@@ -63,9 +56,9 @@
    1. 绑定**变量名称**为`KV`的**KV命名空间**；
    2. 访问管理地址 `https://sub.your-domain.com/auto`，添加你的自建节点链接和机场订阅链接，确保每行一个链接，例如：
       ```
-      vless://b7a392e2-4ef0-4496-90bc-1c37bb234904@your-server.example.com:443?encryption=none&security=tls&sni=your-tunnel.example.com&fp=random&type=ws&host=your-tunnel.example.com&path=%2F%3Fed%3D2048#%E5%8A%A0%E5%85%A5%E6%88%91%E7%9A%84%E9%A2%91%E9%81%93t.me%2FCMLiussss%E8%A7%A3%E9%94%81%E6%9B%B4%E5%A4%9A%E4%BC%98%E9%80%89%E8%8A%82%E7%82%B9
-      vmess://ew0KICAidiI6ICIyIiwNCiAgInBzIjogIuWKoOWFpeaIkeeahOmikemBk3QubWUvQ01MaXVzc3Nz6Kej6ZSB5pu05aSa5LyY6YCJ6IqC54K5PuiLseWbvSDlgKvmlabph5Hono3ln44iLA0KICAiYWRkIjogImNmLjA5MDIyNy54eXoiLA0KICAicG9ydCI6ICI4NDQzIiwNCiAgImlkIjogIjAzZmNjNjE4LWI5M2QtNjc5Ni02YWVkLThhMzhjOTc1ZDU4MSIsDQogICJhaWQiOiAiMCIsDQogICJzY3kiOiAiYXV0byIsDQogICJuZXQiOiAid3MiLA0KICAidHlwZSI6ICJub25lIiwNCiAgImhvc3QiOiAicHBmdjJ0bDl2ZW9qZC1tYWlsbGF6eS5wYWdlcy5kZXYiLA0KICAicGF0aCI6ICIvamFkZXIuZnVuOjQ0My9saW5rdndzIiwNCiAgInRscyI6ICJ0bHMiLA0KICAic25pIjogInBwZnYydGw5dmVvamQtbWFpbGxhenkucGFnZXMuZGV2IiwNCiAgImFscG4iOiAiIiwNCiAgImZwIjogIiINCn0=
-      https://sub.xf.free.hr/auto
+      vless://YOUR-NODE-LINK-HERE
+      vmess://YOUR-NODE-LINK-HERE
+      https://sub.example.com/auto
       https://hy2sub.pages.dev
       ```
 
@@ -109,9 +102,9 @@
    1. 绑定**变量名称**为`KV`的**KV命名空间**；
    2. 访问管理地址 `https://your-project.workers.dev/auto`，添加你的自建节点链接和机场订阅链接，确保每行一个链接，例如：
       ```
-      vless://b7a392e2-4ef0-4496-90bc-1c37bb234904@your-server.example.com:443?encryption=none&security=tls&sni=your-tunnel.example.com&fp=random&type=ws&host=your-tunnel.example.com&path=%2F%3Fed%3D2048#%E5%8A%A0%E5%85%A5%E6%88%91%E7%9A%84%E9%A2%91%E9%81%93t.me%2FCMLiussss%E8%A7%A3%E9%94%81%E6%9B%B4%E5%A4%9A%E4%BC%98%E9%80%89%E8%8A%82%E7%82%B9
-      vmess://ew0KICAidiI6ICIyIiwNCiAgInBzIjogIuWKoOWFpeaIkeeahOmikemBk3QubWUvQ01MaXVzc3Nz6Kej6ZSB5pu05aSa5LyY6YCJ6IqC54K5PuiLseWbvSDlgKvmlabph5Hono3ln44iLA0KICAiYWRkIjogImNmLjA5MDIyNy54eXoiLA0KICAicG9ydCI6ICI4NDQzIiwNCiAgImlkIjogIjAzZmNjNjE4LWI5M2QtNjc5Ni02YWVkLThhMzhjOTc1ZDU4MSIsDQogICJhaWQiOiAiMCIsDQogICJzY3kiOiAiYXV0byIsDQogICJuZXQiOiAid3MiLA0KICAidHlwZSI6ICJub25lIiwNCiAgImhvc3QiOiAicHBmdjJ0bDl2ZW9qZC1tYWlsbGF6eS5wYWdlcy5kZXYiLA0KICAicGF0aCI6ICIvamFkZXIuZnVuOjQ0My9saW5rdndzIiwNCiAgInRscyI6ICJ0bHMiLA0KICAic25pIjogInBwZnYydGw5dmVvamQtbWFpbGxhenkucGFnZXMuZGV2IiwNCiAgImFscG4iOiAiIiwNCiAgImZwIjogIiINCn0=
-      https://sub.xf.free.hr/auto
+      vless://YOUR-NODE-LINK-HERE
+      vmess://YOUR-NODE-LINK-HERE
+      https://sub.example.com/auto
       https://hy2sub.pages.dev
       ```
 
@@ -125,13 +118,13 @@
 | TOKEN | `auto` | ✅ | 仅用于管理配置页面的入口 Token，例如：`/auto` | 
 | SUBTOKEN | `YOUR-UUID-HERE` | ✅ | 客户端订阅 Token，必须为 UUID，例如：`/sub?token=YOUR-UUID-HERE`。也可使用变量名 `SUBUUID` | 
 | KV | （KV 命名空间绑定） | ✅（推荐） | 绑定**变量名称**为 `KV` 的 KV 命名空间，用于保存节点/订阅链接、协议过滤配置与分流规则缓存 | 
-| LINK | `vless://b7a39...`,`vmess://ew0K...`,`https://sub...` | ❌ | 未绑定 KV 时使用：可同时放入多个节点链接与多个订阅链接，链接之间用换行做间隔 |
-| LINKSUB | `https://sub...` | ❌ | 未绑定 KV 时使用：仅填写订阅链接（机场/自建聚合订阅），换行分隔 |
-| PROTOCOL | `vmess,vless,ss` | ❌ | 仅保留指定协议的节点；也可在管理页勾选（存入 KV 的 `PROTOCOL.txt`） |
-| WARP | `warp://...` 或任意节点链接 | ❌ | 追加 WARP 节点到聚合订阅中 |
-| SUBNAME | `CloudSub` | ❌ | 订阅名称 |
-| SUBUPTIME | `6` | ❌ | 客户端订阅自动更新时间（小时），默认 6 |
-| TGTOKEN | `6894123456:XXXXXXXXXX0qExVsBPUhHDAbXXXXXqWXgBA` | ❌ | 发送TG通知的机器人token | 
+| LINK | `vless://...`,`vmess://...`,`https://sub...` | ❌ | 未绑定 KV 时使用：可同时放入多个节点链接与多个订阅链接，链接之间用换行做间隔 | 
+| LINKSUB | `https://sub...` | ❌ | 未绑定 KV 时使用：仅填写订阅链接（机场/自建聚合订阅），换行分隔 | 
+| PROTOCOL | `vmess,vless,ss` | ❌ | 仅保留指定协议的节点；也可在管理页勾选（存入 KV 的 `PROTOCOL.txt`） | 
+| WARP | `warp://...` 或任意节点链接 | ❌ | 追加 WARP 节点到聚合订阅中 | 
+| SUBNAME | `CloudSub` | ❌ | 订阅名称 | 
+| SUBUPTIME | `6` | ❌ | 客户端订阅自动更新时间（小时），默认 6 | 
+| TGTOKEN | `6894123456:***` | ❌ | 发送TG通知的机器人token | 
 | TGID | `6946912345` | ❌ | 接收TG通知的账户数字ID | 
 | TG | `1` | ❌ | 开发者用：`1` 推送所有访问信息，`0`（默认）不推送 | 
 | URL302 | `https://example.com` | ❌ | 未授权访问时的 302 跳转地址 | 
@@ -144,11 +137,3 @@
 - **v2.7.0 起订阅地址变更**：客户端订阅地址为 `/sub?token=<SUBTOKEN>`，`/auto` 仅作为管理页面入口，不再输出订阅内容；
 - **`SUBTOKEN` 为必填项**：未配置或格式不正确时，所有请求将返回 500，请务必在部署时设置 UUID 格式的 `SUBTOKEN`（或 `SUBUUID`），且不能与 `TOKEN` 相同；
 - 项目中，TGTOKEN和TGID在使用时需要先到Telegram注册并获取。其中，TGTOKEN是telegram bot的凭证，TGID是用来接收通知的telegram用户或者组的id。
-
-
-## ⭐ Star 星星走起
-[![Stargazers over time](https://starchart.cc/YOUR-USERNAME/CloudSub.svg?variant=adaptive)](https://starchart.cc/YOUR-USERNAME/CloudSub)
-
-
-# 🙏 致谢
-[Alice Networks LTD](https://example.com/)，[mianayang](https://github.com/mianayang/myself/blob/main/cf-workers/sub/sub.js)、[ACL4SSR](https://github.com/ACL4SSR/ACL4SSR/tree/master/Clash/config)、[肥羊](https://sub.v1.mk/)
