@@ -2,20 +2,31 @@
 // TOKEN 仅用于管理页面；SUBTOKEN/SUBUUID 用于客户端订阅请求。
 
 const DEFAULT_TOKEN = 'auto';
-const DEPLOY_VERSION = 'v2.7.0';
+const DEPLOY_VERSION = 'v2.7.6';
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const DEFAULT_FILE_NAME = 'CloudSub';
 const DEFAULT_UPDATE_TIME = 6;
 
 //节点链接 + 订阅链接
 const DEFAULT_MAIN_DATA = `
-https://example.com/your-sub-link
+https://cfxr.eu.org/getSub
 `;
-const MAX_SUB_SOURCES = 50;
-const MAX_SUB_RESPONSE_BYTES = 5 * 1024 * 1024;
-const MAX_SUB_TOTAL_BYTES = 20 * 1024 * 1024;
+// ===== 订阅源拉取限制(默认值;可用环境变量覆盖) =====
+// SUBMAXSOURCE  聚合订阅源数量上限(默认 50)。注意:免费版 Workers 单请求子请求上限为 50,
+//               若同时启用 Clash 规则集拉取(12 个)或源含重定向,建议按需调小。
+// SUBMAXSIZE    单个订阅源响应大小上限(字节,默认 10MB)。超大订阅被跳过时会在日志提示调大。
+// SUBMAXTOTAL   全部订阅源合计响应大小预算(字节,默认 40MB)。
+//               超出预算的源按用户配置顺序(靠后的先跳过),避免大源因“下载慢、完成晚”被误杀。
+// SUBMAXTIME    单个订阅源拉取超时(毫秒,默认 20000)。
+const DEFAULT_MAX_SUB_SOURCES = 50;
+const DEFAULT_MAX_SUB_RESPONSE_BYTES = 10 * 1024 * 1024;
+const DEFAULT_MAX_SUB_TOTAL_BYTES = 40 * 1024 * 1024;
+const DEFAULT_SUB_FETCH_TIMEOUT_MS = 20000;
 const MAX_KV_CONTENT_BYTES = 2 * 1024 * 1024;
-const SUB_FETCH_TIMEOUT_MS = 20000;
+// 环境变量可配置值的硬上限(避免误配导致 Worker 内存超限,免费版内存为 128MB)
+const HARD_MAX_SUB_RESPONSE_BYTES = 32 * 1024 * 1024;
+const HARD_MAX_SUB_TOTAL_BYTES = 64 * 1024 * 1024;
+const HARD_MAX_SUB_TIMEOUT_MS = 120000;
 
 // ===== 协议过滤(最后合成大订阅时按协议勾选显示) =====
 // 支持过滤的协议类型列表(用于编辑页勾选)
@@ -43,6 +54,14 @@ export default {
 		const TG = Number(env.TG || 0);
 		const fileName = String(env.SUBNAME || DEFAULT_FILE_NAME).slice(0, 80);
 		const SUBUpdateTime = Number(env.SUBUPTIME || DEFAULT_UPDATE_TIME);
+
+		// 订阅源拉取限制(环境变量覆盖,见常量定义处;均设硬上限防内存超限)
+		const 拉取限制 = {
+			sources: Math.min(500, Math.max(1, Number(env.SUBMAXSOURCE) || DEFAULT_MAX_SUB_SOURCES)),
+			perSource: Math.min(HARD_MAX_SUB_RESPONSE_BYTES, Math.max(1, Number(env.SUBMAXSIZE) || DEFAULT_MAX_SUB_RESPONSE_BYTES)),
+			total: Math.min(HARD_MAX_SUB_TOTAL_BYTES, Math.max(1, Number(env.SUBMAXTOTAL) || DEFAULT_MAX_SUB_TOTAL_BYTES)),
+			timeout: Math.min(HARD_MAX_SUB_TIMEOUT_MS, Math.max(1000, Number(env.SUBMAXTIME) || DEFAULT_SUB_FETCH_TIMEOUT_MS)),
+		};
 
 		let MainData = DEFAULT_MAIN_DATA;
 		let urls = [];
@@ -132,9 +151,9 @@ export default {
 			else if (url.searchParams.has('quanx')) 追加UA = 'Quantumult%20X';
 			else if (url.searchParams.has('loon')) 追加UA = 'Loon';
 
-			const 订阅链接数组 = [...new Set(urls)].filter(item => item?.trim?.()).slice(0, MAX_SUB_SOURCES); // 去重并限制来源数量
+			const 订阅链接数组 = [...new Set(urls)].filter(item => item?.trim?.()).slice(0, 拉取限制.sources); // 去重并限制来源数量
 			if (订阅链接数组.length > 0) {
-				const 订阅内容 = await getSUB(订阅链接数组, request, 追加UA, userAgentHeader, fileName);
+				const 订阅内容 = await getSUB(订阅链接数组, request, 追加UA, userAgentHeader, fileName, 拉取限制);
 				if (订阅内容.length > 0) req_data += '\n' + 订阅内容.join('\n');
 			}
 
@@ -361,83 +380,202 @@ async function proxyURL(proxyURL, url) {
 	return newResponse;
 }
 
-async function getSUB(api, request, 追加UA, userAgentHeader, fileName = DEFAULT_FILE_NAME) {
-	if (!api || api.length === 0) {
-		return [];
-	} else api = [...new Set(api)]; // 去重
+// 拉取并解析所有订阅源,返回节点 URI 行数组。
+// 为避免"大链接拉取不完整":
+//  - 单个源超过单源上限(SUBMAXSIZE)时整源跳过并记录日志,可调大 SUBMAXSIZE;
+//  - 全部源合计按总预算(SUBMAXTOTAL)兜底:已知大小(content-length)的源按声明大小
+//    预留预算,未知大小(分块传输/动态生成/压缩)的源按较小名义值参与预算分配,
+//    未知/压缩源的实际读取量由读取阶段流式共享预算兜底,不会突破总预算;
+//  - 压缩响应(content-encoding)的 content-length 为压缩后大小,不再作为拒绝依据,
+//    避免大订阅因声明大小误导而被整源丢弃。
+async function getSUB(api, request, 追加UA, userAgentHeader, fileName = DEFAULT_FILE_NAME, 限制 = {}) {
+	const 源上限 = Math.max(1, 限制.sources || DEFAULT_MAX_SUB_SOURCES);
+	const 单源上限 = Math.max(1, 限制.perSource || DEFAULT_MAX_SUB_RESPONSE_BYTES);
+	const 总预算 = Math.max(1, 限制.total || DEFAULT_MAX_SUB_TOTAL_BYTES);
+	const 超时 = Math.max(1000, 限制.timeout || DEFAULT_SUB_FETCH_TIMEOUT_MS);
+	// 未知长度订阅源(分块传输/动态生成/压缩响应)在预算分配时按较小名义值估算,
+	// 避免每个源都被按单源上限估算、默认预算(40MB)下只能保留少量来源。
+	const 未知长度估算 = Math.min(单源上限, 512 * 1024);
+
+	if (!api || api.length === 0) return [];
+	api = [...new Set(api)].slice(0, 源上限); // 去重并限制来源数量
+	if (api.length === 0) return [];
+
 	let newapi = "";
-	let totalBytes = 0;
+	let 已用预算 = 0;
+	const 释放连接 = response => { try { if (response.body) response.body.cancel().catch(() => {}); } catch (e) { /* 忽略 */ } };
 
-	try {
-		// 使用Promise.allSettled等待所有API请求完成，无论成功或失败
-		const responses = await Promise.allSettled(api.map(apiUrl => getUrl(request, apiUrl, 追加UA, userAgentHeader, AbortSignal.timeout(SUB_FETCH_TIMEOUT_MS)).then(async response => {
-			if (!response.ok) throw response;
-			const content = await readLimitedResponse(response, MAX_SUB_RESPONSE_BYTES);
-			totalBytes += new TextEncoder().encode(content).byteLength;
-			if (totalBytes > MAX_SUB_TOTAL_BYTES) throw new Error('订阅总响应超过大小限制');
-			return content;
-		})));
-
-		// 遍历所有响应
-		const modifiedResponses = responses.map((response, index) => {
-			// 检查是否请求成功
-			if (response.status === 'rejected') {
-				const reason = response.reason;
-				if (reason && (reason.name === 'AbortError' || reason.name === 'TimeoutError')) {
-					return {
-						status: '超时',
-						value: null,
-						apiUrl: api[index] // 将原始的apiUrl添加到返回对象中
-					};
-				}
-				console.error(`订阅源请求失败: ${maskUrl(api[index])}, 状态: ${reason?.status || reason?.message || 'unknown'}`);
-				return {
-					status: '请求失败',
-					value: null,
-					apiUrl: api[index] // 将原始的apiUrl添加到返回对象中
-				};
-			}
-			return {
-				status: response.status,
-				value: response.value,
-				apiUrl: api[index] // 将原始的apiUrl添加到返回对象中
-			};
-		});
-
-		for (const response of modifiedResponses) {
-			// 检查响应状态是否为'fulfilled'
-			if (response.status === 'fulfilled') {
-				try {
-					const content = await response.value || ''; // 获取响应的内容
-					// 统一本地解析:Clash YAML / sing-box / v2ray / SS JSON / Surge / Loon / QX / base64 / 明文
-					const parsed = 本地解析订阅内容(content, fileName);
-					if (parsed && parsed.type === 'uris') {
-						// 已本地识别并解析为节点 URI
-						newapi += parsed.text + '\n';
-					} else if (parsed && parsed.type === 'raw') {
-						// 明文节点链接:原样保留,由后续 uriToClashProxy 统一解析
-						newapi += parsed.text + '\n';
-					} else {
-						// 响应内容无法识别为任何节点格式(异常/站点页等),仅记录日志便于排查,不再往订阅里注入测试节点
-						console.log(`未能识别的订阅来源: ${maskUrl(response.apiUrl)}`);
-					}
-				} catch (e) {
-					// 单个订阅源解析失败不影响其他来源的聚合
-					console.error(`订阅源解析失败: ${maskUrl(response.apiUrl)}, 错误: ${e?.message || e}`);
-				}
-			}
+	// 阶段1: 并行发起请求(只等响应头,不读 body)。
+	// 失败(网络错误/5xx/429)的源自动重试一次,缓解 raw.githubusercontent 等源常见的
+	// 瞬时连接失败导致整源丢失的问题;超时(AbortError)不重试,避免成倍拉长请求时间。
+	// 重试额度:免费版单请求子请求上限为 50,每次重试(含重定向)都会额外消耗子请求,
+	// 这里限制全部源的重试总次数,避免大量源同时失败时把子请求数翻倍突破上限。
+	let 剩余重试 = Math.min(10, Math.max(2, Math.floor(api.length / 3)));
+	const 请求一个源 = async (apiUrl) => {
+		const 尝试 = () => getUrl(request, apiUrl, 追加UA, userAgentHeader, AbortSignal.timeout(超时));
+		const 若可重试 = () => {
+			if (剩余重试 <= 0) return null;
+			剩余重试--;
+			return 尝试();
+		};
+		try {
+			const response = await 尝试();
+			if (response.ok || !(response.status === 429 || response.status >= 500)) return response;
+			释放连接(response);
+			const retryAfter = Number(response.headers.get('retry-after')) || 1; // 尊重服务端退避建议
+			await new Promise(r => setTimeout(r, Math.min(3000, retryAfter * 1000)));
+			const 重试请求 = 若可重试();
+			return 重试请求 ? await 重试请求 : response; // 额度耗尽则按原响应处理
+		} catch (e) {
+			if (e && (e.name === 'AbortError' || e.name === 'TimeoutError')) throw e;
+			await new Promise(r => setTimeout(r, 500));
+			const 重试请求 = 若可重试();
+			if (!重试请求) throw e; // 重试额度耗尽,按原错误处理
+			return await 重试请求; // 连接/DNS 等网络级错误重试一次
 		}
-	} catch (error) {
-		console.error('订阅源处理失败:', error?.message || error);
+	};
+	const 响应结果 = await Promise.allSettled(api.map(apiUrl => 请求一个源(apiUrl)));
+
+	// 阶段2: 按用户配置顺序分配预算并确定各源读取策略。
+	//  - 未压缩且有 content-length:按声明大小估算(受单源上限约束);
+	//  - 压缩或未知长度:声明不可信/不存在,按较小名义值估算。
+	// 超出总预算的源跳过并释放连接(连接数与子请求数因此可控)。
+	const 接受的 = [];
+	for (let i = 0; i < 响应结果.length; i++) {
+		const r = 响应结果[i];
+		if (r.status !== 'fulfilled') {
+			const reason = r.reason;
+			if (reason && (reason.name === 'AbortError' || reason.name === 'TimeoutError')) {
+				console.log(`订阅源请求超时: ${maskUrl(api[i])}`);
+			} else {
+				console.error(`订阅源请求失败: ${maskUrl(api[i])}, 状态: ${reason?.status || reason?.message || 'unknown'}`);
+			}
+			continue;
+		}
+		const response = r.value;
+		if (!response.ok) {
+			console.error(`订阅源请求失败: ${maskUrl(api[i])}, HTTP ${response.status}`);
+			释放连接(response);
+			continue;
+		}
+		const 压缩 = !!response.headers.get('content-encoding');
+		const declared = 压缩 ? 0 : Number(response.headers.get('content-length') || 0);
+		// 未压缩且声明大小超过单源上限:整源跳过,避免无谓下载(压缩响应声明不可信,跳过该检查)
+		if (!压缩 && declared > 单源上限) {
+			console.log(`订阅源响应超过单源上限,已跳过: ${maskUrl(api[i])}, 大小: ${declared} 字节(可调大 SUBMAXSIZE)`);
+			释放连接(response);
+			continue;
+		}
+		const 估算 = declared > 0 ? Math.min(declared, 单源上限) : 未知长度估算;
+		if (已用预算 + 估算 > 总预算) {
+			console.log(`订阅源超出合计预算,已跳过: ${maskUrl(api[i])}(可调大 SUBMAXTOTAL)`);
+			释放连接(response);
+			continue;
+		}
+		已用预算 += 估算;
+		接受的.push({ apiUrl: api[i], response, declared, 压缩 });
+	}
+	if (接受的.length === 0) return [];
+
+	// 阶段3: 读取已接受源的 body(受单源上限与共享预算约束);瞬时读取失败(连接重置等)
+	// 自动重试一次,避免整源因网络抖动丢失。
+	//  - 未压缩已知长度源:并行读取,读取上限 = 单源上限,阶段2已按声明大小预留预算;
+	//  - 压缩源:声明(压缩后大小)不可信,按总预算读取(实际受共享预算约束),完整保留大订阅;
+	//  - 未知长度源:按单源上限读取;未知与压缩源按配置顺序小并发读取(先配置的源优先
+	//    开始读取、优先占用预算),合计读取量由共享预算兜底,避免大源被“完成晚”误杀。
+	const 读取重试 = async (apiUrl, response, 读取上限, 预算) => {
+		// 共享预算按本次读取精确扣减并统计,失败时归还,避免重试被自己先前耗尽的预算误杀
+		const 尝试读取 = async (resp) => {
+			const 本次消耗 = 预算 ? { bytes: 0 } : null;
+			try {
+				return await readLimitedResponse(resp, 读取上限, 预算, 本次消耗);
+			} catch (e) {
+				if (预算 && 本次消耗 && 本次消耗.bytes > 0) 预算.remaining += 本次消耗.bytes; // 归还本次读取占用的预算
+				throw e;
+			}
+		};
+		try {
+			return await 尝试读取(response);
+		} catch (e) {
+			if (e && (e.name === 'AbortError' || e.name === 'TimeoutError' || e.code === 'SUB_LIMIT')) throw e;
+			await new Promise(r => setTimeout(r, 300)); // 网络级瞬时错误,短暂退避后重新拉取一次
+			释放连接(response);
+			const 重试响应 = await getUrl(request, apiUrl, 追加UA, userAgentHeader, AbortSignal.timeout(超时));
+			if (!重试响应.ok) { 释放连接(重试响应); throw new Error('重试仍失败: HTTP ' + 重试响应.status); }
+			return await 尝试读取(重试响应);
+		}
+	};
+	const 已知源 = 接受的.filter(x => x.declared > 0);
+	const 未知源 = 接受的.filter(x => x.declared <= 0);
+	const 已预留已知 = 已知源.reduce((s, x) => s + Math.min(x.declared, 单源上限), 0);
+	const 共享预算 = { remaining: Math.max(0, 总预算 - 已预留已知) };
+	const 已知结果 = await Promise.allSettled(已知源.map(({ apiUrl, response }) =>
+		读取重试(apiUrl, response, 单源上限, null)
+			.then(content => ({ apiUrl, content }))
+			.catch(err => { if (err && typeof err === 'object') err.apiUrl = apiUrl; throw err; })
+	));
+	const 未知结果 = await 有界并发执行(未知源, 8, async ({ apiUrl, response, 压缩 }) =>
+		读取重试(apiUrl, response, 压缩 ? 总预算 : 单源上限, 共享预算)
+			.then(content => ({ apiUrl, content }))
+	);
+	const 内容结果 = [...已知结果, ...未知结果];
+
+	// 阶段4: 按源顺序解析并聚合(已接受的内容不再因后续预算问题丢失)
+	for (const r of 内容结果) {
+		if (r.status !== 'fulfilled') {
+			const reason = r.reason;
+			const 错误描述 = (reason && (reason.name === 'AbortError' || reason.name === 'TimeoutError'))
+				? '读取超时(可调大 SUBMAXTIME)'
+				: (reason?.message || reason);
+			console.error(`订阅源读取失败: ${maskUrl(reason?.apiUrl || '')}, 错误: ${错误描述}`);
+			continue;
+		}
+		const { apiUrl, content } = r.value;
+		try {
+			// 统一本地解析:Clash YAML / sing-box / v2ray / SS JSON / Surge / Loon / QX / base64 / 明文
+			const parsed = 本地解析订阅内容(content, fileName);
+			if (parsed && parsed.type === 'uris') {
+				// 已本地识别并解析为节点 URI
+				newapi += parsed.text + '\n';
+			} else if (parsed && parsed.type === 'raw') {
+				// 明文节点链接:原样保留,由后续 uriToClashProxy 统一解析
+				newapi += parsed.text + '\n';
+			} else {
+				// 响应内容无法识别为任何节点格式(异常/站点页等),仅记录日志便于排查
+				console.log(`未能识别的订阅来源: ${maskUrl(apiUrl)}`);
+			}
+		} catch (e) {
+			// 单个订阅源解析失败不影响其他来源的聚合
+			console.error(`订阅源解析失败: ${maskUrl(apiUrl)}, 错误: ${e?.message || e}`);
+		}
 	}
 
 	// 将处理后的内容转换为数组(已全部本地解析,不再依赖任何第三方转换后端)
 	return await ADD(newapi);
 }
 
+// 有界并发执行任务列表:按传入顺序发起(先配置的源优先开始读取、优先占用共享预算),
+// 返回与 Promise.allSettled 相同结构的结果数组(顺序为完成顺序,不影响后续聚合)。
+async function 有界并发执行(items, limit, fn) {
+	const results = [];
+	const queue = items.slice();
+	await Promise.all(Array.from({ length: Math.min(limit, queue.length) }, async () => {
+		while (queue.length) {
+			const item = queue.shift();
+			try {
+				results.push({ status: 'fulfilled', value: await fn(item) });
+			} catch (err) {
+				if (err && typeof err === 'object') err.apiUrl = err.apiUrl || item.apiUrl;
+				results.push({ status: 'rejected', reason: err });
+			}
+		}
+	}));
+	return results;
+}
+
 async function getUrl(request, targetUrl, 追加UA, userAgentHeader, signal) {
 	const newHeaders = new Headers();
-	newHeaders.set("User-Agent", `${atob('djJyYXlOLzYuNDU=')} YOUR-USERNAME/CloudSub ${追加UA}(${userAgentHeader || 'null'})`);
+	newHeaders.set("User-Agent", `${atob('djJyYXlOLzYuNDU=')} cliechen/CloudSub ${追加UA}(${userAgentHeader || 'null'})`);
 	newHeaders.set("Accept", request.headers.get('Accept') || '*/*');
 
 	// 构建新的请求对象
@@ -468,9 +606,10 @@ function escapeJs(value) {
 	return JSON.stringify(String(value ?? '')).replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
 }
 
-async function readLimitedResponse(response, maxBytes) {
-	const contentLength = Number(response.headers.get('content-length') || 0);
-	if (contentLength > maxBytes) throw new Error('订阅响应超过大小限制');
+async function readLimitedResponse(response, maxBytes, 共享预算 = null, 本次消耗 = null) {
+	// 压缩响应(content-encoding)的 content-length 是压缩后大小,不代表解压后的实际读取量
+	const contentLength = response.headers.get('content-encoding') ? 0 : Number(response.headers.get('content-length') || 0);
+	if (contentLength > maxBytes) { const e = new Error('订阅响应超过大小限制(可调大 SUBMAXSIZE)'); e.code = 'SUB_LIMIT'; throw e; }
 	if (!response.body) return '';
 	const reader = response.body.getReader();
 	const chunks = [];
@@ -480,7 +619,13 @@ async function readLimitedResponse(response, maxBytes) {
 			const { done, value } = await reader.read();
 			if (done) break;
 			total += value.byteLength;
-			if (total > maxBytes) throw new Error('订阅响应超过大小限制');
+			if (total > maxBytes) { const e = new Error('订阅响应超过大小限制(可调大 SUBMAXSIZE)'); e.code = 'SUB_LIMIT'; throw e; }
+			// 共享预算:多个未知长度/压缩源并行读取时按到达顺序流式扣减,总读取量不超过预算
+			if (共享预算) {
+				if (value.byteLength > 共享预算.remaining) { const e = new Error('订阅源超出合计预算(可调大 SUBMAXTOTAL)'); e.code = 'SUB_LIMIT'; throw e; }
+				共享预算.remaining -= value.byteLength;
+				if (本次消耗) 本次消耗.bytes += value.byteLength;
+			}
 			chunks.push(value);
 		}
 	} finally {
@@ -505,7 +650,7 @@ function maskUrl(value) {
 function isValidBase64(str) {
 	// 先移除所有空白字符(空格、换行、回车等)
 	const cleanStr = str.replace(/\s/g, '');
-	const base64Regex = /^[A-Za-z0-9+/=]+$/;
+	const base64Regex = /^[A-Za-z0-9+/=_-]+$/; // 兼容 URL-safe base64(-/_)
 	return base64Regex.test(cleanStr);
 }
 
@@ -515,18 +660,28 @@ function isValidBase64(str) {
 
 function parseYamlValue(v) {
 	v = String(v).trim();
-	if (v === '' || v === 'null' || v === '~') return null;
-	if (v === 'true') return true;
-	if (v === 'false') return false;
-	// 去掉引号(兼容行内注释,如 name: "x" # 备注)
+	// 去掉引号(兼容行内注释,如 name: "x" # 备注);引号包裹的值始终是字符串,
+	// 不会被后面的布尔/空值判断误伤(如 "off" 应保持字符串 "off")。
 	if (v.startsWith('"') || v.startsWith("'")) {
 		const quoteChar = v[0];
 		const endIdx = v.indexOf(quoteChar, 1);
 		if (endIdx > 0) return v.slice(1, endIdx).replace(/\\"/g, '"').replace(/\\\\/g, '\\');
 	}
-	// 去掉行内注释,如 `port: 443 # 端口`
+	// 去掉行内注释,如 `port: 443 # 端口`、`tls: false # 关闭`(注释需先于布尔/数字解析,
+	// 否则 `false # 关闭` 会被当成真值字符串 "false",导致 TLS 被错误启用)。
 	const commentIdx = v.indexOf(' #');
 	if (commentIdx > 0) v = v.slice(0, commentIdx).trim();
+	if (v === '' || v === '~') return null;
+	const lower = v.toLowerCase();
+	// YAML 1.1 布尔/空值词: yes/no/on/off 与 true/false 等价(大小写不敏感)。
+	// 例如 `sni: off` 应解析为布尔 false(表示未设置 SNI),而不是字符串 "off",
+	// 否则聚合后会输出 `sni: "off"`,让客户端把 "off" 当作真实 SNI 使用;
+	// `tls: off` 也应解析为 false,而不是被当成真值从而错误启用 TLS。
+	// 注意:不把单个 y/n 视为布尔(Mihomo 的 yaml.v3 只认 true/false),
+	// 避免误伤合法的单字符字符串值。
+	if (['null'].includes(lower)) return null;
+	if (['true', 'yes', 'on'].includes(lower)) return true;
+	if (['false', 'no', 'off'].includes(lower)) return false;
 	if (/^-?\d+$/.test(v)) return parseInt(v, 10);
 	if (/^-?\d*\.\d+$/.test(v)) return parseFloat(v);
 	return v;
@@ -1771,21 +1926,17 @@ function clashToSingboxOutbound(p) {
 			return o;
 		}
 		case 'ssr': {
-			o.type = 'shadowsocksr';
-			if (p.cipher) o.method = String(p.cipher);
-			if (p.password) o.password = String(p.password);
-			if (p.protocol) o.protocol = String(p.protocol);
-			if (p['protocol-param']) o.protocol_param = String(p['protocol-param']);
-			if (p.obfs) o.obfs = String(p.obfs);
-			if (p['obfs-param']) o.obfs_param = String(p['obfs-param']);
-			return o;
+			// sing-box 1.6.0 起已移除 ShadowsocksR(SSR) 支持,输出会导致整个配置加载失败,故跳过
+			return null;
 		}
 		case 'hysteria2':
 		case 'hy2': {
 			o.type = 'hysteria2';
 			if (p.password) o.password = String(p.password);
-			if (p.sni) { if (!tls) o.tls = { enabled: true }; o.tls.server_name = String(p.sni); }
-			if (p['skip-cert-verify']) { if (!o.tls) o.tls = { enabled: true }; o.tls.insecure = true; }
+			// sing-box 要求 hysteria2 必须启用 TLS,否则报 TLS required 并导致整个配置加载失败
+			if (!o.tls) o.tls = { enabled: true };
+			if (p.sni) o.tls.server_name = String(p.sni);
+			if (p['skip-cert-verify']) o.tls.insecure = true;
 			if (p.up) o.up_mbps = Number(p.up);
 			if (p.down) o.down_mbps = Number(p.down);
 			if (p.obfs) o.obfs = { type: String(p.obfs), password: p['obfs-password'] ? String(p['obfs-password']) : '' };
@@ -1794,10 +1945,12 @@ function clashToSingboxOutbound(p) {
 		case 'hysteria': {
 			o.type = 'hysteria';
 			if (p['auth_str']) o.auth_str = String(p['auth_str']);
-			if (p.sni) { if (!tls) o.tls = { enabled: true }; o.tls.server_name = String(p.sni); }
-			if (p['skip-cert-verify']) { if (!o.tls) o.tls = { enabled: true }; o.tls.insecure = true; }
-			if (p.up) o.up_mbps = Number(p.up);
-			if (p.down) o.down_mbps = Number(p.down);
+			// sing-box 的 hysteria v1 必填 tls 与 up/down 带宽,缺失会导致整个配置加载失败
+			if (!o.tls) o.tls = { enabled: true };
+			if (p.sni) o.tls.server_name = String(p.sni);
+			if (p['skip-cert-verify']) o.tls.insecure = true;
+			o.up_mbps = p.up ? Number(p.up) : 100;
+			o.down_mbps = p.down ? Number(p.down) : 100;
 			if (p.obfs) o.obfs = String(p.obfs);
 			return o;
 		}
@@ -1805,8 +1958,10 @@ function clashToSingboxOutbound(p) {
 			o.type = 'tuic';
 			if (p.uuid) o.uuid = String(p.uuid);
 			if (p.password) o.password = String(p.password);
-			if (p.sni) { if (!tls) o.tls = { enabled: true }; o.tls.server_name = String(p.sni); }
-			if (p['skip-cert-verify']) { if (!o.tls) o.tls = { enabled: true }; o.tls.insecure = true; }
+			// sing-box 的 tuic 必须启用 TLS
+			if (!o.tls) o.tls = { enabled: true };
+			if (p.sni) o.tls.server_name = String(p.sni);
+			if (p['skip-cert-verify']) o.tls.insecure = true;
 			if (p['congestion-controller']) o.congestion_control = String(p['congestion-controller']);
 			if (p['udp-relay-mode']) o.udp_relay_mode = String(p['udp-relay-mode']);
 			if (p['reduce-rtt']) o.reduce_rtt = true;
@@ -1814,24 +1969,17 @@ function clashToSingboxOutbound(p) {
 			return o;
 		}
 		case 'wireguard': {
-			o.type = 'wireguard';
-			if (p.ip) {
-				// sing-box 的 local_address 需要 CIDR 形式
-				const ipStr = String(p.ip);
-				o.local_address = [ipStr.includes('/') ? ipStr : ipStr + '/32'];
-			}
-			if (p['private-key']) o.private_key = String(p['private-key']);
-			if (p['public-key']) o.peer_public_key = String(p['public-key']);
-			if (p['pre-shared-key']) o.pre_shared_key = String(p['pre-shared-key']);
-			if (p.mtu) o.mtu = Number(p.mtu);
-			if (Array.isArray(p.reserved) && p.reserved.length) o.reserved = p.reserved.map(Number);
-			return o;
+			// sing-box 1.12 起废弃旧 wireguard 出站,1.13 彻底移除;
+			// 由 clashToSingboxEndpoint 生成为 endpoints 数组(见 生成本地Singbox配置)
+			return null;
 		}
 		case 'anytls': {
 			o.type = 'anytls';
 			if (p.password) o.password = String(p.password);
-			if (p.sni) { if (!tls) o.tls = { enabled: true }; o.tls.server_name = String(p.sni); }
-			if (p['skip-cert-verify']) { if (!o.tls) o.tls = { enabled: true }; o.tls.insecure = true; }
+			// sing-box 的 anytls 必须启用 TLS
+			if (!o.tls) o.tls = { enabled: true };
+			if (p.sni) o.tls.server_name = String(p.sni);
+			if (p['skip-cert-verify']) o.tls.insecure = true;
 			if (p['idle-session-check-interval']) o.idle_session_check_interval = Number(p['idle-session-check-interval']);
 			if (p['idle-session-timeout']) o.idle_session_timeout = Number(p['idle-session-timeout']);
 			if (p['min-idle-session']) o.min_idle_session = Number(p['min-idle-session']);
@@ -1857,33 +2005,63 @@ function clashToSingboxOutbound(p) {
 	}
 }
 
-// 将单条节点 URI 直接转换为 sing-box outbound(经 Clash 代理对象中转)
-function uriToSingboxOutbound(uri) {
-	const p = uriToClashProxy(uri);
-	if (!p) return null;
-	return clashToSingboxOutbound(p);
+// 将 wireguard 节点转换为 sing-box 1.12+ endpoint 对象
+// (sing-box 1.12 起废弃 wireguard 出站、1.13 移除,新格式为 endpoints 数组:
+//  address + private_key + peers[].address/port/public_key/allowed_ips)
+function clashToSingboxEndpoint(p) {
+	if (!p || p.type !== 'wireguard') return null;
+	if (!p.server || !p.port) return null;
+	// 缺私钥或对端公钥的节点不可用,sing-box 会拒绝该 endpoint,直接丢弃
+	if (!p['private-key'] || !p['public-key']) return null;
+	const ep = {
+		type: 'wireguard',
+		tag: String(p.name || 'wireguard'),
+		mtu: p.mtu ? Number(p.mtu) : 1280,
+	};
+	const ipStr = String(p.ip || '10.0.0.2');
+	ep.address = [ipStr.includes('/') ? ipStr : ipStr + '/32'];
+	ep.private_key = String(p['private-key']);
+	const peer = {
+		address: String(p.server),
+		port: Number(p.port),
+		public_key: p['public-key'] ? String(p['public-key']) : '',
+		allowed_ips: ['0.0.0.0/0'],
+	};
+	if (p['pre-shared-key']) peer.pre_shared_key = String(p['pre-shared-key']);
+	if (Array.isArray(p.reserved) && p.reserved.length) peer.reserved = p.reserved.map(Number);
+	ep.peers = [peer];
+	return ep;
 }
 
 // 本地生成完整 sing-box JSON 配置
 async function 生成本地Singbox配置(节点文本, env, fileName = DEFAULT_FILE_NAME) {
 	const lines = String(节点文本 || '').split('\n').map(s => s.trim()).filter(Boolean);
 	const outbounds = [];
+	const endpoints = [];
 	for (const line of lines) {
-		const o = uriToSingboxOutbound(line);
+		const p = uriToClashProxy(line);
+		if (!p) continue;
+		if (p.type === 'wireguard') {
+			const ep = clashToSingboxEndpoint(p);
+			if (ep) endpoints.push(ep);
+			continue;
+		}
+		const o = clashToSingboxOutbound(p);
 		if (o) outbounds.push(o);
 	}
-	if (outbounds.length === 0) return JSON.stringify({ log: { level: 'info' }, outbounds: [] });
+	if (outbounds.length === 0 && endpoints.length === 0) return JSON.stringify({ log: { level: 'info' }, outbounds: [] });
 
-	// 节点 tag 去重
+	// 节点 tag 去重(出站 + 端点)
 	const seenTags = new Set();
-	for (const o of outbounds) {
+	const allNodes = [...outbounds, ...endpoints];
+	for (const o of allNodes) {
 		let t = o.tag;
 		let i = 2;
 		while (seenTags.has(t)) { t = o.tag + ' ' + i; i++; }
 		seenTags.add(t);
 		o.tag = t;
 	}
-	const nodeTags = outbounds.map(o => o.tag);
+	const nodeTags = allNodes.map(o => o.tag);
 
 	const 直连 = '🎯 全球直连';
 	const 拦截 = '🛑 全球拦截';
@@ -1910,10 +2088,31 @@ async function 生成本地Singbox配置(节点文本, env, fileName = DEFAULT_F
 		log: { level: 'info', timestamp: true },
 		experimental: { cache_file: { enabled: true } },
 		outbounds,
+		// sing-box 1.12+: wireguard 由 outbound 迁移为 endpoint(1.13 起旧格式直接报错)
+		...(endpoints.length ? { endpoints } : {}),
 		route: {
 			rules: [
 				{ ip_cidr: ['127.0.0.0/8', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'], outbound: 直连 },
-				{ geoip: ['cn'], outbound: 直连 },
+				// sing-box 1.12+ 移除了 geoip/geosite 内置数据库规则,必须改用 rule_set(远程 .srs 文件)。
+				// rule_set 自 sing-box 1.4 起全版本可用,兼容所有客户端。
+				{ rule_set: ['geoip-cn'], outbound: 直连 },
+				{ rule_set: ['geosite-cn'], outbound: 直连 },
+			],
+			rule_set: [
+				{
+					tag: 'geoip-cn',
+					type: 'remote',
+					format: 'binary',
+					url: 'https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs',
+					download_detour: 直连,
+				},
+				{
+					tag: 'geosite-cn',
+					type: 'remote',
+					format: 'binary',
+					url: 'https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs',
+					download_detour: 直连,
+				},
 			],
 			final: 漏网,
 			auto_detect_interface: true,
@@ -1995,6 +2194,12 @@ function uriToClashProxy(uri) {
 			const mci = mp.indexOf(':');
 			let remarks = '';
 			try { if (ssp.get('remarks')) remarks = base64Decode(ssp.get('remarks')); } catch { /* 忽略 */ }
+			const protocol = (core[2] || 'origin').toLowerCase();
+			const obfs = (core[3] || 'plain').toLowerCase();
+			// ssr protocol/obfs 白名单:mihomo 对未知值报 initialize protocol/obfs error 并使整个配置加载失败
+			const SSR_PROTOCOLS = new Set(['origin', 'auth_sha1_v4', 'auth_aes128_md5', 'auth_aes128_sha1', 'auth_chain_a', 'auth_chain_b']);
+			const SSR_OBFS = new Set(['plain', 'http_simple', 'http_post', 'random_head', 'tls1.2_ticket_auth', 'tls1.2_ticket_fastauth']);
+			if (!SSR_PROTOCOLS.has(protocol) || !SSR_OBFS.has(obfs)) return null; // 非法 protocol/obfs:丢弃节点
 			const p = {
 				name: remarks || name || (core[0] + ':' + core[1]),
 				server: core[0],
@@ -2002,8 +2207,8 @@ function uriToClashProxy(uri) {
 				type: 'ssr',
 				cipher: mci !== -1 ? mp.slice(0, mci) : 'aes-256-cfb',
 				password: mci !== -1 ? mp.slice(mci + 1) : '',
-				protocol: core[2] || 'origin',
-				obfs: core[3] || 'plain',
+				protocol,
+				obfs,
 			};
 			if (ssp.get('obfsparam')) { try { p['obfs-param'] = base64Decode(ssp.get('obfsparam')); } catch { /* 忽略 */ } }
 			if (ssp.get('protoparam')) { try { p['protocol-param'] = base64Decode(ssp.get('protoparam')); } catch { /* 忽略 */ } }
@@ -2032,13 +2237,31 @@ function uriToClashProxy(uri) {
 					p.tls = true;
 					p.servername = params.get('sni') || server;
 					if (params.get('fp')) p['client-fingerprint'] = params.get('fp');
-					p['reality-opts'] = { 'public-key': params.get('pbk') || '', 'short-id': params.get('sid') || '' };
+					// REALITY 公钥必须为 URL-safe base64(无padding),解码后恰好 32 字节(X25519)
+					// mihomo/sing-box 均用 RawURLEncoding 校验:标准 base64 的 + / 或带 = 的 padding 都会导致
+					// "invalid REALITY public key" 进而使整个配置文件加载失败(OpenClash 无法启动)。
+					const rawPbk = String(params.get('pbk') || '').trim();
+					const urlSafePbk = rawPbk.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+					let pbkOk = false;
+					try {
+						const bytes = Uint8Array.from(atob(urlSafePbk.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
+						pbkOk = bytes.length === 32;
+					} catch { pbkOk = false; }
+					if (!pbkOk) return null; // pbk 缺失/非法:丢弃该节点,避免单个坏节点拖垮整个配置
+					// short-id 必须为偶数长度 hex 且解码后 ≤8 字节,否则 mihomo 报 invalid REALITY short ID
+					const rawSid = String(params.get('sid') || '').trim();
+					const sidOk = /^[0-9a-fA-F]{0,16}$/.test(rawSid) && rawSid.length % 2 === 0;
+					p['reality-opts'] = { 'public-key': urlSafePbk };
+					if (rawSid && sidOk) p['reality-opts']['short-id'] = rawSid.toLowerCase();
 				} else if (security === 'tls') {
 					p.tls = true;
 					if (params.get('sni')) p.servername = params.get('sni');
 					if (params.get('fp')) p['client-fingerprint'] = params.get('fp');
 				}
 				if (params.get('flow')) p.flow = params.get('flow');
+				// flow 白名单防御:仅保留 mihomo/sing-box 已知合法值;垃圾 flow 直接丢弃该字段
+				// (实测 mihomo v1.19.29 对任意 flow 均接受,但旧版本/未来版本可能严格校验,保守起见过滤)
+				if (p.flow && !['xtls-rprx-vision', 'xtls-rprx-vision-udp443'].includes(p.flow)) delete p.flow;
 				if (net === 'ws') p['ws-opts'] = { path: params.get('path') || '/', headers: params.get('host') ? { Host: params.get('host') } : undefined };
 				else if (net === 'grpc') p['grpc-opts'] = { 'grpc-service-name': params.get('serviceName') || params.get('service_name') || '' };
 				else if (net === 'h2' || net === 'http') p['h2-opts'] = { host: params.get('host') ? [params.get('host')] : [], path: params.get('path') || '/' };
@@ -2064,7 +2287,27 @@ function uriToClashProxy(uri) {
 				const ci = decoded.indexOf(':');
 				const cipher = ci !== -1 ? decoded.slice(0, ci) : 'aes-256-gcm';
 				const password = ci !== -1 ? decoded.slice(ci + 1) : decoded;
-				const p = { ...base, type: 'ss', cipher, password, udp: true };
+				if (!password) return null; // ss 空密码:mihomo 报 cipher initialize error,整个配置加载失败
+				// cipher 白名单:mihomo 对不认识的 cipher 报 initialize error 并使整个配置加载失败
+				// (实测 salsa20/camellia-*/rc4/大写变体均被拒,2022-blake3 需 base64 密码解码为 16/32 字节 key)
+				const normCipher = String(cipher).toLowerCase().trim();
+				const SS_CIPHERS = new Set([
+					'aes-128-gcm', 'aes-192-gcm', 'aes-256-gcm',
+					'chacha20-ietf-poly1305', 'xchacha20-ietf-poly1305',
+					'aes-128-cfb', 'aes-192-cfb', 'aes-256-cfb',
+					'rc4-md5', 'chacha20-ietf', 'chacha20', 'none',
+					'aes-128-ctr', 'aes-192-ctr', 'aes-256-ctr',
+					'2022-blake3-aes-128-gcm', '2022-blake3-aes-256-gcm', '2022-blake3-chacha20-poly1305',
+				]);
+				if (!SS_CIPHERS.has(normCipher)) return null;
+				if (normCipher.startsWith('2022-blake3')) {
+					// 2022-blake3 密码必须是 base64 编码的 key:128→16字节,256/chacha20→32字节
+					let keyBytes = null;
+					try { keyBytes = Uint8Array.from(atob(String(password)), c => c.charCodeAt(0)); } catch { /* 非法 base64 */ }
+					const need = normCipher.includes('128') ? 16 : 32;
+					if (!keyBytes || keyBytes.length !== need) return null; // key 长度错误:mihomo 报 bad key length,丢弃节点
+				}
+				const p = { ...base, type: 'ss', cipher: normCipher, password, udp: true };
 				const plugin = params.get('plugin');
 				if (plugin) {
 					const parts = String(plugin).split(';');
@@ -2105,8 +2348,9 @@ function uriToClashProxy(uri) {
 				if (params.get('auth')) p['auth_str'] = params.get('auth');
 				if (params.get('peer')) p.sni = params.get('peer');
 				if (params.get('insecure') === '1') p['skip-cert-verify'] = true;
-				if (params.get('upmbps')) p.up = params.get('upmbps');
-				if (params.get('downmbps')) p.down = params.get('downmbps');
+				// mihomo 的 hysteria v1 必填 up/down,缺失会报 has unset fields 并使整个配置失败,给默认值
+				p.up = params.get('upmbps') || '100';
+				p.down = params.get('downmbps') || '100';
 				return p;
 			}
 			case 'tuic': {
@@ -2121,16 +2365,35 @@ function uriToClashProxy(uri) {
 				return p;
 			}
 			case 'wireguard': {
-				const p = { ...base, type: 'wireguard', ip: params.get('ip') || '10.0.0.2' };
-				if (params.get('pubkey')) p['public-key'] = params.get('pubkey');
-				if (params.get('pvtkey')) p['private-key'] = params.get('pvtkey');
-				if (params.get('presharedkey')) p['pre-shared-key'] = params.get('presharedkey');
+				// wireguard key 必须为标准 base64(可带 + / 与 = padding);URL-safe 无 padding 会被
+				// mihomo 以 decode private key: illegal base64 data 拒绝并导致整个配置加载失败。
+				const normWgKey = (v) => {
+					if (!v) return '';
+					const s = String(v).trim().replace(/-/g, '+').replace(/_/g, '/');
+					const padded = s + '='.repeat((4 - s.length % 4) % 4);
+					try { atob(padded); return padded; } catch { return ''; }
+				};
+				const priv = normWgKey(params.get('pvtkey'));
+				if (!priv) return null; // 缺失/非法 private-key:丢弃节点
+				// mihomo 会为 ip 追加 /32 后解析:非法的 ip 报 ip address parse error 并使整个配置失败
+				const rawIp = String(params.get('ip') || '10.0.0.2').trim();
+				const isIpCidr = /^(\d{1,3}\.){3}\d{1,3}(\/\d{1,2})?$/.test(rawIp) || /^[0-9a-fA-F:]+(\/\d{1,3})?$/.test(rawIp);
+				if (!isIpCidr) return null; // 非法 ip:丢弃节点
+				const p = { ...base, type: 'wireguard', ip: rawIp };
+				p['private-key'] = priv;
+				const pub = normWgKey(params.get('pubkey'));
+				if (pub) p['public-key'] = pub;
+				const psk = normWgKey(params.get('presharedkey'));
+				if (psk) p['pre-shared-key'] = psk;
 				if (params.get('reserved')) p.reserved = String(params.get('reserved')).split(',').map(Number);
-				if (params.get('mtu')) p.mtu = Number(params.get('mtu'));
+				// mtu 必须为正整数,非法值 mihomo 报 cannot parse 'mtu' as int 并使整个配置失败
+				const mtu = Number(params.get('mtu'));
+				if (params.get('mtu') && Number.isInteger(mtu) && mtu > 0) p.mtu = mtu;
 				if (params.get('udp') === '1') p.udp = true;
 				return p;
 			}
 			case 'anytls': {
+				if (!userInfo) return null; // anytls 缺密码:mihomo 报 has unset fields: password,整个配置失败
 				const p = { ...base, type: 'anytls', password: userInfo };
 				if (params.get('sni') || params.get('servername')) p.sni = params.get('sni') || params.get('servername');
 				if (params.get('allowInsecure') === '1') p['skip-cert-verify'] = true;
@@ -2167,9 +2430,18 @@ function uriToClashProxy(uri) {
 }
 
 // ===== YAML 渲染工具 =====
+// 注意:YAML 1.1 会把裸词 off/on/yes/no/y/n 等解析为布尔值(例如 `sni: off` → false),
+// 而 Clash/Mihomo 内核要求 sni/servername/host 等字段必须是字符串,
+// 因此所有字符串值一律用双引号包裹,保证生成 `sni: "off"` 这类安全 YAML。
 function yamlValue(v) {
 	if (typeof v === 'number' || typeof v === 'boolean') return String(v);
-	return '"' + String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+	// 转义反斜杠、双引号与控制字符(如节点名里的换行/制表符/行分隔符),
+	// 防止生成非法 YAML 导致 OpenClash/Mihomo 无法解析整个配置。
+	return '"' + String(v)
+		.replace(/\\/g, '\\\\')
+		.replace(/"/g, '\\"')
+		.replace(/[\u0000-\u001f\u007f\u2028\u2029]/g, ch => '\\u' + ch.charCodeAt(0).toString(16).padStart(4, '0'))
+		+ '"';
 }
 
 function yamlInline(obj) {
@@ -2185,7 +2457,9 @@ function yamlEmit(obj, indent) {
 	const pad = ' '.repeat(indent);
 	const out = [];
 	for (const [k, v] of Object.entries(obj)) {
-		if (v === undefined || v === null || v === '') continue;
+		// 注意:不能跳过空字符串!vmess/vless/trojan/ssr 的空 uuid/password 必须以 "" 输出,
+		// 否则字段缺失会触发 mihomo 的 "has unset fields" 校验错误,导致整个配置文件加载失败。
+		if (v === undefined || v === null) continue;
 		if (Array.isArray(v)) {
 			if (v.length === 0) continue;
 			out.push(pad + k + ':');
@@ -2203,9 +2477,35 @@ function yamlEmit(obj, indent) {
 	return out.join('\n');
 }
 
+// Clash 中允许布尔值的字段;其余字段若出现布尔值(如 sni: false)一律视为"未设置"丢弃,
+// 避免生成 `sni: false` 这类 YAML 解析后为布尔、被 Clash 内核以"sni 必须是字符串"拒绝的配置。
+const CLASH_BOOL_KEYS = new Set(['tls', 'udp', 'skip-cert-verify', 'reduce-rtt', 'allowInsecure', 'insecure']);
+
+// 规整代理对象:递归丢弃出现在字符串字段里的布尔值,并剥离 null/undefined。
+function 规整Clash代理(p) {
+	if (!p || typeof p !== 'object') return p;
+	const out = {};
+	for (const [k, v] of Object.entries(p)) {
+		if (v === undefined || v === null) continue;
+		if (Array.isArray(v)) {
+			out[k] = v.map(x => (x && typeof x === 'object') ? 规整Clash代理(x) : x);
+		} else if (v && typeof v === 'object') {
+			const nested = 规整Clash代理(v);
+			// 嵌套对象清空(如 headers: {Host: false})后直接丢弃,避免输出悬空的空映射
+			if (Object.keys(nested).length === 0) continue;
+			out[k] = nested;
+		} else if (typeof v === 'boolean' && !CLASH_BOOL_KEYS.has(k)) {
+			continue; // 布尔值出现在非布尔字段(如 sni/servername)→ 视为未设置
+		} else {
+			out[k] = v;
+		}
+	}
+	return out;
+}
+
 // 渲染单个代理
 function 渲染Clash代理(p) {
-	return '- ' + yamlEmit(p, 2).slice(2);
+	return '- ' + yamlEmit(规整Clash代理(p), 2).slice(2);
 }
 
 // 渲染策略组
@@ -2231,6 +2531,10 @@ const 内置Clash规则 = [
 	'IP-CIDR,192.168.0.0/16,DIRECT,no-resolve',
 ];
 
+// Mihomo 内置保留代理名 + 本生成器使用的策略组名。
+// 规则引用了不存在的组会报 proxy [xxx] not found 并使整个配置加载失败,生成规则时必须校验。
+const MIHOMO_RULE_GROUPS = new Set(['DIRECT', 'REJECT', 'REJECT-DROP', 'PASS', 'COMPATIBLE', 'GLOBAL', '🎯 全球直连', '🛑 全球拦截', '🌍 国外媒体', '📲 电报信息', '💬 Ai平台', '🚀 节点选择', '♻️ 自动选择', '🐟 漏网之鱼']);
+
 // Mihomo/Meta 核心支持的规则类型白名单;其余类型(如 URL-REGEX)直接丢弃,
 // 避免 OpenClash/Mihomo 因不支持的规则类型而报错或无法启动。
 const MIHOMO_RULE_TYPES = new Set([
@@ -2253,6 +2557,10 @@ function 规范化Clash规则(raw) {
 	const hasNoResolve = parts.some(p => p.toLowerCase() === 'no-resolve');
 	const rest = parts.slice(1).filter(p => p.toLowerCase() !== 'no-resolve');
 	if (rest.length === 0) return '';
+	// 规则最后一段是策略组名,必须存在于已知组集合,否则 mihomo 报 proxy [xxx] not found
+	// 并使整个配置加载失败。MATCH 规则只有策略名一个参数,同样校验。
+	const groupName = rest[rest.length - 1];
+	if (!MIHOMO_RULE_GROUPS.has(groupName)) return '';
 	return type + ',' + rest.join(',') + (hasNoResolve ? ',no-resolve' : '');
 }
 
@@ -2341,17 +2649,9 @@ async function 生成本地Clash配置(节点文本, env, fileName = DEFAULT_FIL
 	}
 	if (proxies.length === 0) return '# 无可用节点\n';
 
-	// 节点名去重(Clash 要求唯一)
-	const seenNames = new Set();
-	for (const p of proxies) {
-		let n = p.name;
-		let i = 2;
-		while (seenNames.has(n)) { n = p.name + ' ' + i; i++; }
-		seenNames.add(n);
-		p.name = n;
-	}
-	const nodeNames = proxies.map(p => p.name);
-
+	// 节点名去重(Clash 要求唯一)。除节点间重名外,还必须规避:
+	//  1) mihomo 内置保留名 DIRECT/REJECT/PASS/COMPATIBLE/REJECT-DROP(实测同名直接导致整个配置加载失败);
+	//  2) 下方生成的策略组名(节点与组同名同样报 duplicate name)。
 	const 直连 = '🎯 全球直连';
 	const 拦截 = '🛑 全球拦截';
 	const 媒体 = '🌍 国外媒体';
@@ -2360,6 +2660,15 @@ async function 生成本地Clash配置(节点文本, env, fileName = DEFAULT_FIL
 	const 节点选择 = '🚀 节点选择';
 	const 自动选择 = '♻️ 自动选择';
 	const 漏网 = '🐟 漏网之鱼';
+	const seenNames = new Set(['DIRECT', 'REJECT', 'PASS', 'COMPATIBLE', 'REJECT-DROP', 直连, 拦截, 媒体, 电报, Ai, 节点选择, 自动选择, 漏网]);
+	for (const p of proxies) {
+		let n = p.name;
+		let i = 2;
+		while (seenNames.has(n)) { n = p.name + ' ' + i; i++; }
+		seenNames.add(n);
+		p.name = n;
+	}
+	const nodeNames = proxies.map(p => p.name);
 
 	const groups = [
 		{ name: 节点选择, type: 'select', proxies: [自动选择, ...nodeNames, 直连] },
@@ -2539,8 +2848,8 @@ async function 生成本地Surge配置(节点文本, env, fileName = DEFAULT_FIL
 	}
 	if (proxyLines.length === 0) return '# 无可用节点\n';
 
-	// 节点名去重(Surge 要求唯一),同步更新对应的 [Proxy] 行
-	const seenNames = new Set();
+	// 节点名去重(Surge 要求唯一),同步更新对应的 [Proxy] 行;同时规避 DIRECT/REJECT 等内置保留名
+	const seenNames = new Set(['DIRECT', 'REJECT', 'PASS', 'COMPATIBLE', 'REJECT-DROP', '🎯 全球直连', '🛑 全球拦截', '🌍 国外媒体', '📲 电报信息', '💬 Ai平台', '🚀 节点选择', '♻️ 自动选择', '🐟 漏网之鱼']);
 	for (let i = 0; i < names.length; i++) {
 		let n = names[i];
 		let k = 2;
@@ -2749,8 +3058,8 @@ async function 生成本地Quanx配置(节点文本, env, fileName = DEFAULT_FIL
 	}
 	if (servers.length === 0) return '# 无可用节点\n';
 
-	// 节点名去重(QX 的 tag 需唯一)
-	const seenNames = new Set();
+	// 节点名去重(QX 的 tag 需唯一);同时规避内置保留名
+	const seenNames = new Set(['DIRECT', 'REJECT', 'PASS', 'COMPATIBLE', 'REJECT-DROP', 'direct', 'reject', 'proxy', '🎯 全球直连', '🛑 全球拦截', '🌍 国外媒体', '📲 电报信息', '💬 Ai平台', '🚀 节点选择', '♻️ 自动选择', '🐟 漏网之鱼']);
 	for (let i = 0; i < names.length; i++) {
 		let n = names[i];
 		let k = 2;
@@ -2952,8 +3261,8 @@ async function 生成本地Loon配置(节点文本, env, fileName = DEFAULT_FILE
 	}
 	if (proxies.length === 0) return '# 无可用节点\n';
 
-	// 节点名去重(Loon 要求唯一),同步更新 [Proxy] 行
-	const seenNames = new Set();
+	// 节点名去重(Loon 要求唯一),同步更新 [Proxy] 行;同时规避 DIRECT/REJECT 等内置保留名
+	const seenNames = new Set(['DIRECT', 'REJECT', 'PASS', 'COMPATIBLE', 'REJECT-DROP', '🎯 全球直连', '🛑 全球拦截', '🌍 国外媒体', '📲 电报信息', '💬 Ai平台', '🚀 节点选择', '♻️ 自动选择', '🐟 漏网之鱼']);
 	for (let i = 0; i < names.length; i++) {
 		let n = names[i];
 		let k = 2;
