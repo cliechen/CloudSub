@@ -126,9 +126,10 @@
 | LINK | `vless://...`, `vmess://...`, `https://...` | ❌ | 未绑定 KV 时使用：可同时放入多个节点链接与多个订阅链接，链接之间用换行做间隔 |
 | LINKSUB | `https://sub...` | ❌ | 未绑定 KV 时使用：仅填写订阅链接（机场/自建聚合订阅），换行分隔 |
 | PROTOCOL | `vmess,vless,ss` | ❌ | 仅保留指定协议的节点；也可在管理页勾选（存入 KV 的 `PROTOCOL.txt`） |
+| NOCN | `1` / `true` / `on` | ❌ | 剔除「中国大陆」节点。简单规则：节点名称含「省份/直辖市/重点城市/中国/大陆/内地/国内/境内」等地域词，或「移动/联通/电信/天翼/铁通」等运营商词即剔除；名称含香港/澳门/台湾的不受影响。也可在管理页勾选（存入 KV 的 `NOCN.txt`）。值可为 `1`、`true`、`on`、`yes`、`开`、`是` |
 | WARP | `warp://...` 或任意节点链接 | ❌ | 追加 WARP 节点到聚合订阅中 |
 | SUBNAME | `CloudSub` | ❌ | 订阅名称 |
-| SUBUPTIME | `6` | ❌ | 客户端订阅自动更新时间（小时），默认 6 |
+| SUBUPTIME | `6` | ❌ | 客户端订阅自动更新时间（小时），默认 6，范围 1-168 |
 | SUBMAXSOURCE | `50` | ❌ | 聚合订阅源数量上限（默认 50）；免费版 Workers 单请求子请求上限为 50（含 Clash 规则集拉取），源较多时建议调小 |
 | SUBMAXSIZE | `10485760` | ❌ | 单个订阅源响应大小上限（字节，默认 10MB）；超大订阅被跳过时在日志中提示调大 |
 | SUBMAXTOTAL | `41943040` | ❌ | 全部订阅源合计响应大小预算（字节，默认 40MB）；超出后按配置顺序跳过靠后的源，避免大源因下载慢被误杀 |
@@ -159,6 +160,68 @@ node test/test_subscription.mjs
 ```
 
 脚本会逐个（并发受限）拉取每个源并统计 HTTP 状态、是否缺失 `content-length`、是否 gzip、响应大小与解析出的节点数，再用 `getSUB` 全流程（生产默认限制）聚合，对比去重后的节点完整性。瞬时网络失败会自动重试一次；挂起的上游连接由硬超时看门狗终止。
+
+## 🛠 开发与构建（源码模块化）
+
+> 从 `v2.8.0` 起，源码由单文件 `_worker.js` **按职责拆分到 `src/` 目录**，便于维护与审阅：
+
+```
+src/
+├── 00-constants.js         # 配置常量、协议列表、拉取限制
+├── 10-handler.js           # 入口 fetch 处理器(订阅请求路由 + 聚合缓存)
+├── 15-notify.js            # ADD / nginx / TG 通知 / base64 / 哈希工具
+├── 20-http.js              # 代理跳转 / getSUB 订阅源拉取 / 响应读取
+├── 30-clash-parser.js      # Clash YAML 订阅解析
+├── 40-singbox-parser.js    # sing-box / v2ray JSON 订阅解析
+├── 50-multiformat-parser.js# Surge / Loon / QX / SS / base64 多格式解析
+├── 60-convert.js           # 节点与 sing-box / YAML 转换工具
+├── 70-render-rules.js      # YAML 渲染 / ACL4SSR 规则获取与缓存
+├── 80-generators.js        # Clash / Surge / QX / Loon 配置本地生成
+├── 90-filter-dedup.js      # 按协议过滤 / 节点去重
+└── 95-admin.js             # KV 管理页 + 数据迁移
+```
+
+所有 `src/*.js` 处于**同一模块作用域**（不互相 `import`），`build.js` 按序拼接回单文件 `_worker.js`，保证：
+
+- `_worker.js` 仍是**可直接粘贴进 Workers 编辑器**的部署产物，与旧版行为完全一致；
+- 减少单文件体积、按职责分文件维护、便于 Code Review 与后续演进。
+
+常用命令（需 Node ≥ 18）：
+
+```bash
+npm run build       # 由 src/ 重新生成 _worker.js
+npm run check       # 校验 src 行数与 _worker.js 一致 + 语法检查
+npm test            # 重构建并运行离线单元测试(tests/unit.test.mjs,不联网)
+npm run lint        # ESLint(需先 npm install)
+```
+
+> ⚠️ 开发时请**修改 `src/` 下的源码**，改完运行 `npm run build` 刷新 `_worker.js`，不要直接改 `_worker.js`（它由构建生成）。
+
+### 聚合结果 KV 缓存（含“变化才下载”）
+
+`/sub` 默认每次都会重新拉取全部上游订阅源。从 `v2.8.0` 起，聚合、去重、按协议过滤后的最终节点结果会按「自建节点 + 订阅源 + 协议过滤 + WARP」的哈希**缓存在 KV**（一份缓存服务 base64/clash/singbox/surge/quanx/loon 所有格式）。为降低 Cloudflare 后台资源占用，实现四层机制：
+
+1. **实例内存热缓存（秒级）**：同一 Worker 实例内命中则完全不碰 KV、不拉上游，大幅减少 KV 读取；
+2. **KV 缓存（TTL=SUBUPTIME）**：跨实例复用权威结果；
+3. **SWR 后台刷新 + 条件请求（“有变化才下载”）**：缓存靠近过期且被访问时，用 `ctx.waitUntil` 在后台带上上次的 `ETag`/`Last-Modified` 去刷新——上游全部返回 **304（内容未变）则“不下载 body、不重建、仅续期”**，真正有变化才下载；用户请求不阻塞；
+4. **防惊群锁**：缓存 cold 时仅一个请求承担全量拉取，其余等待读取结果，避免并发重复拉取。
+
+追加 `&refresh` 可强制重建（无论是否变化都重新拉取）。未绑定 KV 时自动退化为每次都实时聚合（与原行为一致）。
+
+聚合结果写入 KV 前会按 UTF-8 字节数检查项目设置的 KV 缓存安全上限（2 MiB）；超过限制时仅跳过持久化缓存，不影响当前请求返回。此时应降低订阅规模或拆分订阅源。
+
+> ⚠️ 说明：Cloudflare Worker 代码只在“有请求时”运行，无真正的后台定时器。因此上述刷新由“访问 + 后台异步收尾”驱动，而非固定间隔的心跳；若需“无人访问也定时刷新”，必须另行配置 Cron Triggers（需手动设置，本项目默认不做）。
+
+聚合缓存使用的 KV 键（均以 `SUB_` 前缀，避免与用户数据键冲突）：
+
+| 键 | 用途 |
+|---|---|
+| `SUB_AGG:<sha256>` | 聚合去重过滤后的最终节点文本（TTL=SUBUPTIME） |
+| `SUB_AGG_AT:<sha256>` | 上次聚合写入的时间戳（SWR 判断接近过期用） |
+| `SUB_ETAG:<sha256(url)>` | 每个订阅源上次的 ETag/Last-Modified（条件请求凭据） |
+| `SUB_REFRESH_AT:<sha256>` | 后台刷新调度防抖（防多实例并发） |
+| `SUB_LOCK:<sha256>` | 重建锁（防惊群） |
+
 
 ## ⭐ Star 星星走起
 [![Stargazers over time](https://starchart.cc/cliechen/CloudSub.svg?variant=adaptive)](https://starchart.cc/cliechen/CloudSub)

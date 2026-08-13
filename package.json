@@ -1,0 +1,20 @@
+{
+	"name": "cloudsub",
+	"version": "2.7.6",
+	"description": "自建汇聚订阅 CloudSub - Cloudflare Workers 订阅聚合(多节点/多订阅合并为单一链接)",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"build": "node build.js",
+		"check": "node build.js --check && node --check _worker.js",
+		"test": "node build.js && node tests/unit.test.mjs",
+		"test:online": "node test/test_subscription.mjs",
+		"lint": "eslint src build.js tests"
+	},
+	"devDependencies": {
+		"eslint": "^9.0.0"
+	},
+	"engines": {
+		"node": ">=18"
+	}
+}

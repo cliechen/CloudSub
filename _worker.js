@@ -7,10 +7,8 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3
 const DEFAULT_FILE_NAME = 'CloudSub';
 const DEFAULT_UPDATE_TIME = 6;
 
-//节点链接 + 订阅链接
-const DEFAULT_MAIN_DATA = `
-https://cfxr.eu.org/getSub
-`;
+//节点链接 + 订阅链接（默认留空，请自行在 env 中配置 LINK 或通过管理页添加）
+const DEFAULT_MAIN_DATA = ``;
 // ===== 订阅源拉取限制(默认值;可用环境变量覆盖) =====
 // SUBMAXSOURCE  聚合订阅源数量上限(默认 50)。注意:免费版 Workers 单请求子请求上限为 50,
 //               若同时启用 Clash 规则集拉取(12 个)或源含重定向,建议按需调小。
@@ -32,8 +30,137 @@ const HARD_MAX_SUB_TIMEOUT_MS = 120000;
 // 支持过滤的协议类型列表(用于编辑页勾选)
 const 支持协议 = ['vmess', 'vless', 'ss', 'ssr', 'trojan', 'hysteria2', 'hysteria', 'tuic', 'wireguard', 'anytls', 'socks', 'http'];
 
+// ===== 实例内存热缓存(纯 Worker 内,避免高频请求每次都读 KV) =====
+// 聚合结果在“上游未变化”前提下是确定性的,故内存缓存与 KV 缓存可安全并存。
+// 注意:Worker 实例可能被回收,内存缓存只是热点加速层,KV 才是权威。
+const 内存TTL秒 = 60;
+const 内存缓存 = new Map(); // key -> { value, expireAt }
+function 内存缓存取(key) {
+	const e = 内存缓存.get(key);
+	if (!e) return null;
+	if (Date.now() > e.expireAt) { 内存缓存.delete(key); return null; }
+	return e.value;
+}
+function 内存缓存放(key, value) {
+	if (!value) return;
+	if (内存缓存.size >= 1024) { // 简单清理过期项,防止无限增长
+		for (const [k, v] of 内存缓存) { if (Date.now() > v.expireAt) 内存缓存.delete(k); }
+	}
+	内存缓存.set(key, { value, expireAt: Date.now() + 内存TTL秒 * 1000 });
+}
+
+// ===== 订阅源条件请求凭据(ETag / Last-Modified)存取 =====
+// 用于“有变化才下载”:后台刷新带上上次 ETag,上游返回 304 则不下载 body。
+async function 读取源条件(env, urls) {
+	if (!env || !env.KV || !urls || urls.length === 0) return null;
+	const 表 = {};
+	await Promise.all(urls.map(async u => {
+		try {
+			const raw = await env.KV.get('SUB_ETAG:' + await hashText(u));
+			if (raw) { const o = JSON.parse(raw); if (o && (o.etag || o.lastModified)) 表[u] = o; }
+		} catch (e) { /* 该源无凭据则做一次普通请求 */ }
+	}));
+	return Object.keys(表).length ? 表 : null;
+}
+async function 保存源条件(env, 新表, ttlHours = 24) {
+	if (!env || !env.KV || !新表) return;
+	await Promise.all(Object.entries(新表).map(async ([u, v]) => {
+		try {
+			// 与聚合缓存(SUB_AGG)采用相同 TTL,避免 ETag 常驻而聚合缓存已过期:
+			// 否则上游返回 304 时因无旧缓存而重建出"缺失所有订阅源节点"的残缺结果。
+			await env.KV.put('SUB_ETAG:' + await hashText(u), JSON.stringify(v), { expirationTtl: ttlHours * 3600 });
+		} catch (e) { /* 忽略 */ }
+	}));
+}
+
+// ===== 执行一次聚合刷新并写缓存 =====
+// 使用条件请求(ETag)实现“有变化才下载”:多数刷新周期源未变化(304)时不下载 body。
+// 返回新的 过滤结果;若全部源都未变化且存在可复用的旧缓存,则“不下载、不重建、仅续期”,返回 null。
+async function 执行聚合刷新({ MainData, 订阅链接数组, 协议过滤, 剔除大陆, WARP, env, request, 追加UA, userAgentHeader, fileName, 拉取限制, KV缓存键, 时间戳键, SUBUpdateTime, 写缓存, 旧缓存 }) {
+	const etags = await 读取源条件(env, 订阅链接数组);
+	const 标记 = {};
+	let req_data = MainData;
+	if (订阅链接数组.length > 0) {
+		let 订阅内容 = await getSUB(订阅链接数组, request, 追加UA, userAgentHeader, fileName, 拉取限制, { etags, 标记 });
+		// 全部源 304(未变化)且有旧缓存可复用:沿用旧值,仅续期时间戳,不下载、不重建。
+		if (标记.全部未变化 && 旧缓存) {
+			if (写缓存 && env.KV) {
+				try { await env.KV.put(时间戳键, String(Date.now()), { expirationTtl: SUBUpdateTime * 3600 }); } catch (e) { /* 忽略 */ }
+			}
+			内存缓存放(KV缓存键, 旧缓存);
+			return null;
+		}
+		// 全部源 304 但无旧缓存(缓存已过期而 ETag 仍有效):不能据 304 重建内容,
+		// 必须去条件化重拉一次,否则会缓存一份缺失所有订阅源节点的残缺结果。
+		if (标记.全部未变化) {
+			console.log('全部源 304 但无旧缓存,已去条件化重拉,避免缓存残缺结果');
+			const 新标记 = {};
+			订阅内容 = await getSUB(订阅链接数组, request, 追加UA, userAgentHeader, fileName, 拉取限制, { etags: null, 标记: 新标记 });
+			标记.新etags = 新标记.新etags || 标记.新etags;
+		}
+		if (订阅内容.length > 0) req_data += '\n' + 订阅内容.join('\n');
+		// 持久化本次获取到的最新源 ETag(与缓存同 TTL,避免 ETag 比缓存活得久)
+		if (标记.新etags) await 保存源条件(env, 标记.新etags, SUBUpdateTime);
+	}
+
+	if (WARP) {
+		const warpNodes = await ADD(WARP);
+		if (warpNodes.length > 0) req_data += '\n' + warpNodes.join('\n');
+	}
+	//去重 + 按协议过滤 (+ 可选剔除大陆节点)
+	const text = new TextDecoder().decode(new TextEncoder().encode(req_data));
+	let 过滤结果 = 过滤协议节点(节点去重(text), 协议过滤);
+	if (剔除大陆) 过滤结果 = 剔除大陆节点(过滤结果);
+
+	if (写缓存 && env.KV && 过滤结果) {
+		const bytes = new TextEncoder().encode(过滤结果).byteLength;
+		if (bytes <= MAX_KV_CONTENT_BYTES) {
+			try {
+				await env.KV.put(KV缓存键, 过滤结果, { expirationTtl: SUBUpdateTime * 3600 });
+				await env.KV.put(时间戳键, String(Date.now()), { expirationTtl: SUBUpdateTime * 3600 });
+			} catch (e) {
+				console.error(`聚合缓存写入失败: ${KV缓存键}, ${bytes} 字节, ${e?.message || e}`);
+			}
+		} else {
+			console.error(`聚合结果超过项目 KV 缓存安全上限,跳过缓存: ${KV缓存键}, ${bytes} 字节`);
+		}
+	}
+	内存缓存放(KV缓存键, 过滤结果);
+	return 过滤结果;
+}
+
+// ===== 触发后台刷新(SWR,访问驱动) =====
+// 缓存靠近过期且被访问时,把刷新放到 ctx.waitUntil 后台执行,用户请求不阻塞。
+// 双防抖(实例内存 + KV),避免每个请求都去读 KV 防抖键,也避免多实例并发重复调度。
+const SWR调度记录 = new Map(); // 防抖键 -> 上次调度时间戳(实例内存)
+async function 触发后台刷新(ctx, env, 缓存键, 时间戳键, SUBUpdateTime, 当前值, 刷新参数) {
+	try {
+		const 防抖键 = 'SUB_REFRESH_AT:' + 缓存键;
+		// 1) 实例内存节流:每实例每键每 5 分钟才真正访问 KV 一次
+		const 上次数值 = SWR调度记录.get(防抖键) || 0;
+		if (Date.now() - 上次数值 < 5 * 60 * 1000) return;
+		SWR调度记录.set(防抖键, Date.now());
+		// 只有缓存接近 TTL 过期时才刷新。时间戳缺失时按旧缓存处理,避免永久不刷新。
+		let 缓存时间 = 0;
+		try { 缓存时间 = Number(await env.KV.get(时间戳键) || 0); } catch (e) { /* 按缺失时间戳处理 */ }
+		const ttlMs = SUBUpdateTime * 3600 * 1000;
+		const refreshWindowMs = Math.max(5 * 60 * 1000, Math.min(ttlMs / 5, 60 * 60 * 1000));
+		if (缓存时间 && Date.now() - 缓存时间 < Math.max(0, ttlMs - refreshWindowMs)) return;
+		// 2) KV 防抖:防止多实例/多请求并发调度同一刷新
+		let 最近刷 = 0;
+		try { 最近刷 = Number(await env.KV.get(防抖键) || 0); } catch (e) { 最近刷 = 0; }
+		if (Date.now() - 最近刷 < 5 * 60 * 1000) return; // 5 分钟内已调度则跳过
+		try { await env.KV.put(防抖键, String(Date.now()), { expirationTtl: 600 }); } catch (e) { return; }
+		ctx.waitUntil((async () => {
+			try {
+				await 执行聚合刷新({ ...刷新参数, 写缓存: true, 旧缓存: 当前值 || null });
+			} catch (e) { console.error('后台刷新失败:', e && e.message || e); }
+		})());
+	} catch (e) { /* 忽略后台刷新调度错误 */ }
+}
+
 export default {
-	async fetch(request, env) {
+	async fetch(request, env, ctx) {
 		const userAgentHeader = request.headers.get('User-Agent');
 		const userAgent = userAgentHeader ? userAgentHeader.toLowerCase() : "null";
 		const url = new URL(request.url);
@@ -53,7 +180,7 @@ export default {
 		const ChatID = env.TGID || '';
 		const TG = Number(env.TG || 0);
 		const fileName = String(env.SUBNAME || DEFAULT_FILE_NAME).slice(0, 80);
-		const SUBUpdateTime = Number(env.SUBUPTIME || DEFAULT_UPDATE_TIME);
+		const SUBUpdateTime = Math.min(168, Math.max(1, Number(env.SUBUPTIME) || DEFAULT_UPDATE_TIME));
 
 		// 订阅源拉取限制(环境变量覆盖,见常量定义处;均设硬上限防内存超限)
 		const 拉取限制 = {
@@ -111,12 +238,20 @@ export default {
 					if (t) 协议过滤.add(t);
 				}
 			}
+			// 读取「剔除大陆节点」开关(可选项)
+			// 来源: KV 命名空间 NOCN.txt,或环境变量 NOCN。值为 1/true/on/yes/开/是 时启用。
+			const 剔除大陆 = /^(1|true|on|yes|开|是)$/i.test(String((env.KV ? await env.KV.get('NOCN.txt') : (env.NOCN || '')) || '').trim());
 
 			let 重新汇总所有链接 = await ADD(MainData + '\n' + urls.join('\n'));
 			let 自建节点 = "";
 			let 订阅链接 = "";
+			// 区分“http/https 订阅链接”与“http/https 代理节点”:
+			// 形如 http(s)://[user:pass@]host:port[#name] 或结尾是 host:port 的,是节点而非订阅地址。
+			// 否则会把 http 代理节点误当远程订阅去拉取。
+			const 是Http节点 = (x) => /^https?:\/\//i.test(x)
+				&& (/^https?:\/\/[^/]*@[^/]+:\d+/i.test(x) || /^https?:\/\/[^/]+:\d+([?#]|$)/i.test(x));
 			for (let x of 重新汇总所有链接) {
-				if (x.toLowerCase().startsWith('http')) {
+				if (/^https?:\/\//i.test(x) && !是Http节点(x)) {
 					订阅链接 += x + '\n';
 				} else {
 					自建节点 += x + '\n';
@@ -141,8 +276,7 @@ export default {
 				}
 			}
 
-			let req_data = MainData;
-
+			// 追加UA 仅用于 getSUB 拉取上游时的标识;格式仍在下方按 订阅格式 本地生成
 			let 追加UA = 'v2rayn';
 			if (url.searchParams.has('b64') || url.searchParams.has('base64')) 订阅格式 = 'base64';
 			else if (url.searchParams.has('clash')) 追加UA = 'clash';
@@ -152,56 +286,75 @@ export default {
 			else if (url.searchParams.has('loon')) 追加UA = 'Loon';
 
 			const 订阅链接数组 = [...new Set(urls)].filter(item => item?.trim?.()).slice(0, 拉取限制.sources); // 去重并限制来源数量
-			if (订阅链接数组.length > 0) {
-				const 订阅内容 = await getSUB(订阅链接数组, request, 追加UA, userAgentHeader, fileName, 拉取限制);
-				if (订阅内容.length > 0) req_data += '\n' + 订阅内容.join('\n');
+
+			// ===== 聚合结果缓存(性能优化) =====
+			// 把「聚合、去重、按协议过滤后的最终节点文本」按 自建节点+订阅源列表+协议过滤+WARP
+			// 的哈希缓存在 KV(SUB_AGG:<sha256>),一份缓存服务所有格式(base64/clash/singbox/...)。
+			// 三层机制降低资源占用:
+			//  1) 实例内存热缓存(秒级):命中则完全不碰 KV、不拉上游;
+			//  2) KV 缓存(TTL=SUBUPTIME):跨实例复用;
+			//  3) SWR + 条件请求:缓存靠近过期且被访问时,在后台(ctx.waitUntil)用
+			//     ETag/Last-Modified 刷新——上游全 304 则“不下载、不重建、仅续期”,真正变化才下载;
+			//  4) 防惊群锁:缓存 cold 时仅一个请求承担全量拉取,其余等待读取结果。
+			// 追加 &refresh 强制重建;未绑定 KV 时退化为实时聚合。
+			const 缓存因子 = [MainData, 订阅链接数组.join('\n'), [...协议过滤].sort().join(','), env.WARP || '', 剔除大陆 ? '1' : '0'].join('\u0001');
+			const 缓存键 = await hashText(缓存因子);
+			const KV缓存键 = 'SUB_AGG:' + 缓存键;
+			const 时间戳键 = 'SUB_AGG_AT:' + 缓存键;
+			const 强制刷新 = url.searchParams.has('refresh');
+			const 刷新参数 = { MainData, 订阅链接数组, 协议过滤, 剔除大陆, WARP: env.WARP || '', env, request, 追加UA, userAgentHeader, fileName, 拉取限制, KV缓存键, 时间戳键, SUBUpdateTime };
+
+			// 1) 实例内存热缓存
+			let 过滤结果 = (!强制刷新) ? 内存缓存取(KV缓存键) : null;
+
+			// 2) KV 缓存
+			let KV值 = '';
+			if (!过滤结果 && env.KV) {
+				try { KV值 = await env.KV.get(KV缓存键) || ''; } catch (e) { KV值 = ''; }
+				过滤结果 = (!强制刷新) ? (KV值 || null) : null;
 			}
 
-			if (env.WARP) {
-				const warpNodes = await ADD(env.WARP);
-				if (warpNodes.length > 0) req_data += '\n' + warpNodes.join('\n');
-			}
-			//修复中文错误
-			const utf8Encoder = new TextEncoder();
-			const encodedData = utf8Encoder.encode(req_data);
-			//const text = String.fromCharCode.apply(null, encodedData);
-			const utf8Decoder = new TextDecoder();
-			const text = utf8Decoder.decode(encodedData);
-
-			//去重(忽略节点名称差异,同一节点仅保留第一次出现)
-			const result = 节点去重(text);
-			//console.log(result);
-
-			// 按协议过滤: 只保留编辑页勾选的协议节点;未勾选任何协议(不设置)则全部显示
-			const 过滤结果 = 过滤协议节点(result, 协议过滤);
-			//console.log(过滤结果);
-
-			let base64Data;
-			try {
-				base64Data = btoa(过滤结果);
-			} catch (e) {
-				function encodeBase64(data) {
-					const binary = new TextEncoder().encode(data);
-					let base64 = '';
-					const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-
-					for (let i = 0; i < binary.length; i += 3) {
-						const byte1 = binary[i];
-						const byte2 = binary[i + 1] || 0;
-						const byte3 = binary[i + 2] || 0;
-
-						base64 += chars[byte1 >> 2];
-						base64 += chars[((byte1 & 3) << 4) | (byte2 >> 4)];
-						base64 += chars[((byte2 & 15) << 2) | (byte3 >> 6)];
-						base64 += chars[byte3 & 63];
-					}
-
-					const padding = 3 - (binary.length % 3 || 3);
-					return base64.slice(0, base64.length - padding) + '=='.slice(0, padding);
+			if (过滤结果) {
+				if (!KV值) 内存缓存放(KV缓存键, 过滤结果); // 来自内存或 KV,均回填内存热缓存
+				// 3) SWR:缓存靠近过期且被访问时,后台续期/刷新(本请求不阻塞)
+				if (KV值 && ctx && env.KV && !强制刷新 && 订阅链接数组.length > 0) {
+					await 触发后台刷新(ctx, env, 缓存键, 时间戳键, SUBUpdateTime, 过滤结果, 刷新参数);
 				}
-
-				base64Data = encodeBase64(过滤结果)
+			} else {
+				// 4) 缓存 cold 或强制刷新:以防惊群锁方式同步重建
+				const 锁键 = 'SUB_LOCK:' + 缓存键;
+				let 拿锁 = false;
+				try {
+					if (env.KV) {
+						const 已有锁 = await env.KV.get(锁键);
+						if (!已有锁) {
+							await env.KV.put(锁键, String(Date.now()), { expirationTtl: 120 });
+							拿锁 = true;
+						}
+					} else { 拿锁 = true; }
+				} catch (e) { 拿锁 = true; } // 无 KV 或失败则直接在本请求内重建
+				if (拿锁) {
+					try {
+						过滤结果 = await 执行聚合刷新({ ...刷新参数, 写缓存: !!env.KV, 旧缓存: null });
+					} finally {
+						if (env.KV) { try { await env.KV.delete(锁键); } catch (e) { /* 忽略 */ } }
+					}
+				} else if (env.KV) {
+					// 其它请求正在重建:短等待后读取 KV 结果(最多约 4 次)
+					for (let i = 0; i < 4 && !过滤结果; i++) {
+						await new Promise(r => setTimeout(r, 200));
+						try { 过滤结果 = await env.KV.get(KV缓存键) || ''; } catch (e) { 过滤结果 = ''; }
+					}
+				}
+				// 仍未取到(无 KV 或等待超时):直接同步聚合兜底
+				if (!过滤结果) {
+					过滤结果 = await 执行聚合刷新({ ...刷新参数, 写缓存: !!env.KV, 旧缓存: null }) || '';
+				}
+				if (过滤结果) 内存缓存放(KV缓存键, 过滤结果);
 			}
+			过滤结果 = 过滤结果 || '';
+
+
 
 			// 构建响应头对象
 			const responseHeaders = {
@@ -215,7 +368,30 @@ export default {
 			};
 
 			if (订阅格式 == 'base64') {
+				// 仅 base64 需编码(懒计算):clash/singbox/surge/qx/loon 等不走此分支,
+				// 避免对 2MB 级大订阅每次做一次无谓的 base64 编码。
+				let base64Data;
+				try {
+					base64Data = btoa(过滤结果);
+				} catch (e) {
+					// btoa 对非 Latin1 字符串抛错,回退为 UTF-8 -> base64(处理含中文的订阅名)
+					const binary = new TextEncoder().encode(过滤结果);
+					let base64 = '';
+					const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+					for (let i = 0; i < binary.length; i += 3) {
+						const byte1 = binary[i];
+						const byte2 = binary[i + 1] || 0;
+						const byte3 = binary[i + 2] || 0;
+						base64 += chars[byte1 >> 2];
+						base64 += chars[((byte1 & 3) << 4) | (byte2 >> 4)];
+						base64 += chars[((byte2 & 15) << 2) | (byte3 >> 6)];
+						base64 += chars[byte3 & 63];
+					}
+					const padding = 3 - (binary.length % 3 || 3);
+					base64Data = base64.slice(0, base64.length - padding) + '=='.slice(0, padding);
+				}
 				return new Response(base64Data, { headers: responseHeaders });
+			} else if (订阅格式 == 'clash') {
 			} else if (订阅格式 == 'clash') {
 				// ===== 方案A:本地生成 Clash 配置,不依赖第三方 SUBAPI =====
 				// 分流规则优先使用 KV 缓存的 ACL4SSR 规则集,无 KV 时回退内置精简规则
@@ -320,24 +496,23 @@ async function sendMessage(type, ip, add_data = "", botToken = '', chatID = '') 
 }
 
 function base64Decode(str) {
-	str = String(str).replace(/-/g, '+').replace(/_/g, '/');
+	str = String(str);
+	// 容错:部分订阅源/base64 段落带换行/空格,且长度不整除 4(缺 padding)。
+	// 若不处理,Cloudflare 的 atob 会抛异常导致整个源解析失败。
+	str = str.replace(/\s+/g, '');
+	const pad = (4 - (str.length % 4)) % 4;
+	if (pad) str += '==='.slice(0, pad);
+	str = str.replace(/-/g, '+').replace(/_/g, '/');
 	const bytes = new Uint8Array(atob(str).split('').map(c => c.charCodeAt(0)));
 	const decoder = new TextDecoder('utf-8');
 	return decoder.decode(bytes);
 }
 
-async function MD5MD5(text) {
-	const encoder = new TextEncoder();
-
-	const firstPass = await crypto.subtle.digest('MD5', encoder.encode(text));
-	const firstPassArray = Array.from(new Uint8Array(firstPass));
-	const firstHex = firstPassArray.map(b => b.toString(16).padStart(2, '0')).join('');
-
-	const secondPass = await crypto.subtle.digest('MD5', encoder.encode(firstHex.slice(7, 27)));
-	const secondPassArray = Array.from(new Uint8Array(secondPass));
-	const secondHex = secondPassArray.map(b => b.toString(16).padStart(2, '0')).join('');
-
-	return secondHex.toLowerCase();
+// 对文本做 SHA-256 哈希,返回 64 位十六进制字符串(确定性,用于聚合结果 KV 缓存键)。
+// 原 MD5MD5 为未使用的死代码,移除并替换为本函数。
+async function hashText(text) {
+	const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(text ?? '')));
+	return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
 async function proxyURL(proxyURL, url) {
@@ -346,12 +521,10 @@ async function proxyURL(proxyURL, url) {
 
 	// 解析目标 URL
 	let parsedURL = new URL(fullURL);
-	console.log(parsedURL);
 	// 提取并可能修改 URL 组件
 	let URLProtocol = parsedURL.protocol.slice(0, -1) || 'https';
 	let URLHostname = parsedURL.hostname;
 	let URLPathname = parsedURL.pathname;
-	let URLSearch = parsedURL.search;
 
 	// 处理 pathname
 	if (URLPathname.charAt(URLPathname.length - 1) == '/') {
@@ -359,8 +532,9 @@ async function proxyURL(proxyURL, url) {
 	}
 	URLPathname += url.pathname;
 
-	// 构建新的 URL
-	let newURL = `${URLProtocol}://${URLHostname}${URLPathname}${URLSearch}`;
+	// 构建新的 URL:转发「请求」的查询串(如 /sub?token=...)而不是代理源自身的查询串,
+	// 否则反向代理目标拿不到客户端参数。
+	let newURL = `${URLProtocol}://${URLHostname}${URLPathname}${url.search}`;
 
 	// 反向代理请求
 	let response = await fetch(newURL);
@@ -388,7 +562,8 @@ async function proxyURL(proxyURL, url) {
 //    未知/压缩源的实际读取量由读取阶段流式共享预算兜底,不会突破总预算;
 //  - 压缩响应(content-encoding)的 content-length 为压缩后大小,不再作为拒绝依据,
 //    避免大订阅因声明大小误导而被整源丢弃。
-async function getSUB(api, request, 追加UA, userAgentHeader, fileName = DEFAULT_FILE_NAME, 限制 = {}) {
+async function getSUB(api, request, 追加UA, userAgentHeader, fileName = DEFAULT_FILE_NAME, 限制 = {}, opts = {}) {
+	const { etags = null, 标记 = {} } = opts || {};
 	const 源上限 = Math.max(1, 限制.sources || DEFAULT_MAX_SUB_SOURCES);
 	const 单源上限 = Math.max(1, 限制.perSource || DEFAULT_MAX_SUB_RESPONSE_BYTES);
 	const 总预算 = Math.max(1, 限制.total || DEFAULT_MAX_SUB_TOTAL_BYTES);
@@ -403,6 +578,7 @@ async function getSUB(api, request, 追加UA, userAgentHeader, fileName = DEFAUL
 
 	let newapi = "";
 	let 已用预算 = 0;
+	let 未变化数 = 0; // 条件请求下返回 304(内容未变化)的源数量
 	const 释放连接 = response => { try { if (response.body) response.body.cancel().catch(() => {}); } catch (e) { /* 忽略 */ } };
 
 	// 阶段1: 并行发起请求(只等响应头,不读 body)。
@@ -412,7 +588,7 @@ async function getSUB(api, request, 追加UA, userAgentHeader, fileName = DEFAUL
 	// 这里限制全部源的重试总次数,避免大量源同时失败时把子请求数翻倍突破上限。
 	let 剩余重试 = Math.min(10, Math.max(2, Math.floor(api.length / 3)));
 	const 请求一个源 = async (apiUrl) => {
-		const 尝试 = () => getUrl(request, apiUrl, 追加UA, userAgentHeader, AbortSignal.timeout(超时));
+		const 尝试 = () => getUrl(request, apiUrl, 追加UA, userAgentHeader, AbortSignal.timeout(超时), (etags && etags[apiUrl]) || null);
 		const 若可重试 = () => {
 			if (剩余重试 <= 0) return null;
 			剩余重试--;
@@ -420,6 +596,8 @@ async function getSUB(api, request, 追加UA, userAgentHeader, fileName = DEFAUL
 		};
 		try {
 			const response = await 尝试();
+			// 条件请求命中:上游内容未变化(304),无需下载 body
+			if (response.status === 304) { 释放连接(response); return { __未变化: true }; }
 			if (response.ok || !(response.status === 429 || response.status >= 500)) return response;
 			释放连接(response);
 			const retryAfter = Number(response.headers.get('retry-after')) || 1; // 尊重服务端退避建议
@@ -443,6 +621,8 @@ async function getSUB(api, request, 追加UA, userAgentHeader, fileName = DEFAUL
 	const 接受的 = [];
 	for (let i = 0; i < 响应结果.length; i++) {
 		const r = 响应结果[i];
+		const 值 = r.status === 'fulfilled' ? r.value : null;
+		if (值 && 值.__未变化) { 未变化数++; continue; }
 		if (r.status !== 'fulfilled') {
 			const reason = r.reason;
 			if (reason && (reason.name === 'AbortError' || reason.name === 'TimeoutError')) {
@@ -453,10 +633,18 @@ async function getSUB(api, request, 追加UA, userAgentHeader, fileName = DEFAUL
 			continue;
 		}
 		const response = r.value;
+		if (response.status === 304) { 未变化数++; 释放连接(response); continue; }
 		if (!response.ok) {
 			console.error(`订阅源请求失败: ${maskUrl(api[i])}, HTTP ${response.status}`);
 			释放连接(response);
 			continue;
+		}
+		// 记录该源最新的 ETag / Last-Modified,供下一次条件请求使用(有变化才下载的凭据)
+		const _etag = response.headers.get('etag') || '';
+		const _lm = response.headers.get('last-modified') || '';
+		if (_etag || _lm) {
+			标记.新etags = 标记.新etags || {};
+			标记.新etags[api[i]] = { etag: _etag, lastModified: _lm };
 		}
 		const 压缩 = !!response.headers.get('content-encoding');
 		const declared = 压缩 ? 0 : Number(response.headers.get('content-length') || 0);
@@ -475,6 +663,8 @@ async function getSUB(api, request, 追加UA, userAgentHeader, fileName = DEFAUL
 		已用预算 += 估算;
 		接受的.push({ apiUrl: api[i], response, declared, 压缩 });
 	}
+	// 全部源都 304:聚合内容未变化(后台刷新时借此“不下载、不重建、仅续期”)
+	标记.全部未变化 = 接受的.length === 0 && 未变化数 === api.length;
 	if (接受的.length === 0) return [];
 
 	// 阶段3: 读取已接受源的 body(受单源上限与共享预算约束);瞬时读取失败(连接重置等)
@@ -573,10 +763,17 @@ async function 有界并发执行(items, limit, fn) {
 	return results;
 }
 
-async function getUrl(request, targetUrl, 追加UA, userAgentHeader, signal) {
+async function getUrl(request, targetUrl, 追加UA, userAgentHeader, signal, 条件 = null) {
 	const newHeaders = new Headers();
 	newHeaders.set("User-Agent", `${atob('djJyYXlOLzYuNDU=')} cliechen/CloudSub ${追加UA}(${userAgentHeader || 'null'})`);
 	newHeaders.set("Accept", request.headers.get('Accept') || '*/*');
+
+	// 条件请求:带上次拉取的 ETag / Last-Modified,上游若返回 304 表示内容未变化,
+	// 从而避免重复下载 body(用于后台刷新时的“有变化才下载”)。
+	if (条件) {
+		if (条件.etag) newHeaders.set('If-None-Match', 条件.etag);
+		if (条件.lastModified) newHeaders.set('If-Modified-Since', 条件.lastModified);
+	}
 
 	// 构建新的请求对象
 	const modifiedRequest = new Request(targetUrl, {
@@ -662,10 +859,37 @@ function parseYamlValue(v) {
 	v = String(v).trim();
 	// 去掉引号(兼容行内注释,如 name: "x" # 备注);引号包裹的值始终是字符串,
 	// 不会被后面的布尔/空值判断误伤(如 "off" 应保持字符串 "off")。
-	if (v.startsWith('"') || v.startsWith("'")) {
-		const quoteChar = v[0];
-		const endIdx = v.indexOf(quoteChar, 1);
-		if (endIdx > 0) return v.slice(1, endIdx).replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+	// 注意逐字符扫描闭合引号并处理转义:双引号用 \" 转义,单引号用 '' 转义,
+	// 否则含转义引号的名称(如 "q\"uote"、'it''s')会被错误截断。
+	if (v.startsWith('"')) {
+		let out = '';
+		for (let i = 1; i < v.length; i++) {
+			const c = v[i];
+			if (c === '"') return out; // 闭合
+			if (c === '\\' && i + 1 < v.length) {
+				const n = v[i + 1];
+				if (n === '"') { out += '"'; i++; continue; }
+				if (n === '\\') { out += '\\'; i++; continue; }
+				if (n === 'n') { out += '\n'; i++; continue; }
+				if (n === 't') { out += '\t'; i++; continue; }
+				out += c + n; i++; continue;
+			}
+			out += c;
+		}
+		// 未找到闭合引号:视为整段普通字符串(保留原样,避免误伤)
+		return v.slice(1);
+	}
+	if (v.startsWith("'")) {
+		let out = '';
+		for (let i = 1; i < v.length; i++) {
+			const c = v[i];
+			if (c === "'") {
+				if (v[i + 1] === "'") { out += "'"; i++; continue; } // '' 转义单引号
+				return out; // 闭合
+			}
+			out += c;
+		}
+		return v.slice(1);
 	}
 	// 去掉行内注释,如 `port: 443 # 端口`、`tls: false # 关闭`(注释需先于布尔/数字解析,
 	// 否则 `false # 关闭` 会被当成真值字符串 "false",导致 TLS 被错误启用)。
@@ -2033,14 +2257,49 @@ function clashToSingboxEndpoint(p) {
 	return ep;
 }
 
+// 协议级节点校验(供各格式生成器共用,宁缺毋滥:不合格节点整条丢弃,不拖垮整份配置)
+// 除 server/port 外,还校验各协议必填凭据与关键字段值域,拦截“能解析但字段残缺/非法”的节点。
+// 这些字段若残缺或非法,OpenClash(mihomo)/sing-box 等对格式要求严格的客户端会直接拒绝
+// 整个配置或让该节点不可用。
+const 合法网络 = new Set(['tcp', 'ws', 'grpc', 'http', 'h2']);
+function 校验节点(p) {
+	if (!p || typeof p !== 'object') return false;
+	if (!p.server) return false;
+	const server = String(p.server).trim();
+	if (!server || server.length > 253) return false;
+	const port = Number(p.port);
+	if (!Number.isInteger(port) || port < 1 || port > 65535) return false;
+	const net = String(p.network || 'tcp').toLowerCase();
+	if (!合法网络.has(net)) return false;
+	switch (p.type) {
+		case 'vmess': return !!(p.uuid && p.cipher);
+		case 'vless': return !!p.uuid;
+		case 'ss': return !!(p.password && p.cipher);
+		case 'ssr': return !!(p.password && p.cipher && p.protocol && p.obfs);
+		case 'trojan': return !!p.password;
+		case 'hysteria2':
+		case 'hy2': return !!p.password;
+		case 'hysteria': return true; // up/down 有默认值兜底
+		case 'tuic': return !!(p.uuid && p.password);
+		case 'wireguard': return !!(p['public-key'] && p['private-key'] && p.ip);
+		case 'anytls': return !!p.password;
+		case 'socks':
+		case 'socks5':
+		case 'http':
+		case 'https': return true;
+		default: return false; // 未知协议:丢弃
+	}
+}
+
 // 本地生成完整 sing-box JSON 配置
 async function 生成本地Singbox配置(节点文本, env, fileName = DEFAULT_FILE_NAME) {
 	const lines = String(节点文本 || '').split('\n').map(s => s.trim()).filter(Boolean);
 	const outbounds = [];
 	const endpoints = [];
 	for (const line of lines) {
-		const p = uriToClashProxy(line);
-		if (!p) continue;
+		let p;
+		try { p = uriToClashProxy(line); } catch (e) { p = null; } // 单节点解析失败只跳过该节点
+		if (!p || !校验节点(p)) continue; // 协议级校验:不合格节点宁缺毋滥
 		if (p.type === 'wireguard') {
 			const ep = clashToSingboxEndpoint(p);
 			if (ep) endpoints.push(ep);
@@ -2626,8 +2885,9 @@ async function 获取Clash规则(env) {
 			基础规则.push('MATCH,🐟 漏网之鱼');
 			return 基础规则;
 		}
-		await env.KV.put('CLASH_RULES.txt', rules.join('\n'));
-		await env.KV.put('CLASH_RULES_AT', String(now));
+		// 内容和时间戳使用相同 TTL,避免失效规则长期残留在 KV。
+		await env.KV.put('CLASH_RULES.txt', rules.join('\n'), { expirationTtl: 24 * 3600 });
+		await env.KV.put('CLASH_RULES_AT', String(now), { expirationTtl: 24 * 3600 });
 		基础规则.push(...rules);
 		基础规则.push('GEOIP,CN,DIRECT');
 		基础规则.push('MATCH,🐟 漏网之鱼');
@@ -2644,8 +2904,9 @@ async function 生成本地Clash配置(节点文本, env, fileName = DEFAULT_FIL
 	const lines = String(节点文本 || '').split('\n').map(s => s.trim()).filter(Boolean);
 	const proxies = [];
 	for (const line of lines) {
-		const p = uriToClashProxy(line);
-		if (p && p.server && p.port) proxies.push(p);
+		let p;
+		try { p = uriToClashProxy(line); } catch (e) { p = null; } // 单节点解析失败只跳过该节点
+		if (p && 校验节点(p)) proxies.push(p); // 协议级校验:不合格节点宁缺毋滥
 	}
 	if (proxies.length === 0) return '# 无可用节点\n';
 
@@ -2690,7 +2951,9 @@ async function 生成本地Clash配置(节点文本, env, fileName = DEFAULT_FIL
 	out.push('log-level: info');
 	out.push('');
 	out.push('proxies:');
-	for (const p of proxies) out.push(渲染Clash代理(p));
+	for (const p of proxies) {
+		try { out.push(渲染Clash代理(p)); } catch (e) { /* 单节点渲染失败只跳过该节点,不拖垮整份配置 */ }
+	}
 	out.push('');
 	out.push('proxy-groups:');
 	for (const g of groups) out.push(渲染Clash策略组(g));
@@ -2838,8 +3101,9 @@ async function 生成本地Surge配置(节点文本, env, fileName = DEFAULT_FIL
 	const names = [];
 	let wgIndex = 0;
 	for (const line of lines) {
-		const p = uriToClashProxy(line);
-		if (!p) continue;
+		let p;
+		try { p = uriToClashProxy(line); } catch (e) { p = null; } // 单节点解析失败只跳过该节点
+		if (!p || !校验节点(p)) continue; // 协议级校验:不合格节点宁缺毋滥
 		const r = clashToSurgeProxy(p, wgIndex);
 		if (!r) continue;
 		if (r.wgSection) { wgSections.push(r.wgSection); wgIndex++; }
@@ -3049,8 +3313,9 @@ async function 生成本地Quanx配置(节点文本, env, fileName = DEFAULT_FIL
 	const servers = [];
 	const names = [];
 	for (const line of lines) {
-		const p = uriToClashProxy(line);
-		if (!p) continue;
+		let p;
+		try { p = uriToClashProxy(line); } catch (e) { p = null; } // 单节点解析失败只跳过该节点
+		if (!p || !校验节点(p)) continue; // 协议级校验:不合格节点宁缺毋滥
 		const s = clashToQuanxServer(p);
 		if (!s) continue;
 		servers.push(s);
@@ -3369,6 +3634,57 @@ function 节点去重身份(line) {
 	}
 }
 
+// ==================== 剔除中国大陆节点 ====================
+// 简单策略:节点名称命中「大陆关键词」即剔除,不做境外优化标记等额外判断。
+//   1. 关键词包含:省份/直辖市/重点城市/中国/大陆/内地/国内/境内 等地域词,以及
+//      大陆运营商词(移动/联通/电信/天翼/铁通)。
+//   2. 故意不包含 香港/澳门/台湾,因此这些地区节点不会误删。
+const 大陆地域词 = /北京|上海|广州|深圳|天津|重庆|成都|杭州|南京|武汉|西安|长沙|郑州|青岛|大连|东莞|福州|厦门|昆明|长春|沈阳|哈尔滨|乌鲁木齐|呼和浩特|南宁|贵阳|兰州|拉萨|银川|西宁|石家庄|太原|济南|合肥|南昌|苏州|无锡|宁波|温州|佛山|珠海|中山|惠州|汕头|湛江|三亚|常州|南通|徐州|扬州|嘉兴|绍兴|金华|台州|泉州|烟台|潍坊|临沂|淄博|济宁|泰安|洛阳|襄阳|宜昌|株洲|湘潭|岳阳|衡阳|绵阳|德阳|宜宾|南充|赣州|上饶|遵义|保定|廊坊|秦皇岛|唐山|邯郸|咸阳|宝鸡|河北|山西|辽宁|吉林|黑龙江|江苏|浙江|安徽|福建|江西|山东|河南|湖北|湖南|广东|海南|四川|贵州|云南|陕西|甘肃|青海|内蒙古|广西|西藏|宁夏|新疆|中国|大陆|内地|国内|境内|移动|联通|电信|天翼|铁通/;
+
+// 安全解码:仅当字符串含 % 时才尝试 URL 解码(vmess ps / # 片段可能被百分号编码),
+// 解码失败时保留原始字符串,避免误报。
+function 安全解码(v) {
+	if (typeof v !== 'string') return '';
+	if (v.includes('%')) { try { return decodeURIComponent(v); } catch (e) { /* 保留原样 */ } }
+	return v;
+}
+
+// 解析一行节点链接的「显示名称」:vmess 取 base64 JSON 的 ps,ssr 取 remarks,
+// 其余协议取 # 后的片段(尽量做 URL 解码);解析不到名称返回空串。
+function 解析节点名(line) {
+	const s = String(line || '').trim();
+	if (!s) return '';
+	try {
+		if (s.startsWith('vmess://')) {
+			const json = JSON.parse(base64Decode(s.slice(8)));
+			if (json && json.ps) return 安全解码(String(json.ps));
+			// vmess 无 ps 时回退到 # 片段
+		}
+		if (s.startsWith('ssr://')) {
+			const decoded = base64Decode(s.slice(6));
+			const m = decoded.match(/remarks=([^&]*)/);
+			if (m) return 安全解码(m[1]);
+		}
+	} catch (e) { /* 解析失败回退到 # 片段 */ }
+	const hash = s.lastIndexOf('#');
+	if (hash !== -1) return 安全解码(s.slice(hash + 1));
+	return '';
+}
+
+// 剔除「大陆节点」:名称命中「大陆关键词」的节点直接剔除,其余一律保留(宁缺毋滥)。
+// 特例:名称含「香港/澳门/台湾」的节点(如「中国香港-01」「中国台湾」)不影响跨境使用,一律保留。
+function 剔除大陆节点(text) {
+	const src = String(text || '');
+	return src.split('\n').filter(line => {
+		const s = line.trim();
+		if (!s) return true; // 保留空行
+		const 名 = 解析节点名(s);
+		if (!名) return true; // 取不到名称(注释等)一律保留
+		if (/香港|澳门|台湾/.test(名)) return true; // 港澳台节点保留(如「中国香港」)
+		return !大陆地域词.test(名);
+	}).join('\n');
+}
+
 // 文本去重:同一节点(忽略名称差异)仅保留第一次出现的行
 function 节点去重(text) {
 	const uniqueLines = [];
@@ -3420,6 +3736,11 @@ async function KV(request, env, txt = 'ADD.txt', { subscriptionToken, fileName }
 					await env.KV.put('PROTOCOL.txt', clean);
 					return new Response("协议过滤设置已保存");
 				}
+				// 剔除大陆节点开关: 使用 ?save=nocn 区分,保存到 NOCN.txt
+				if (url.searchParams.get('save') === 'nocn') {
+					await env.KV.put('NOCN.txt', String(content).trim());
+					return new Response("剔除大陆节点设置已保存");
+				}
 				await env.KV.put(txt, content);
 				return new Response("保存成功");
 			} catch (error) {
@@ -3451,6 +3772,13 @@ async function KV(request, env, txt = 'ADD.txt', { subscriptionToken, fileName }
 			const checked = 已选协议.has(p) ? 'checked' : '';
 			return `<label style="margin-right:12px;display:inline-block;white-space:nowrap;"><input type="checkbox" class="proto-cb" value="${p}" ${checked}> ${p}</label>`;
 		}).join('');
+		// 读取「剔除大陆节点」开关并生成勾选状态
+		let nocnConfig = '';
+		if (hasKV) {
+			try { nocnConfig = await env.KV.get('NOCN.txt') || ''; } catch (e) { nocnConfig = ''; }
+		}
+		const 剔除大陆已开 = /^(1|true|on|yes|开|是)$/i.test(String(nocnConfig || '').trim());
+
 		const safeFileName = escapeHtml(fileName);
 		const safeContent = '';
 		const contentLiteral = escapeJs(content);
@@ -3650,6 +3978,17 @@ async function KV(request, env, txt = 'ADD.txt', { subscriptionToken, fileName }
 							</div>
 							<div style="font-size:12px;color:#888;">提示：一个都不勾选并保存 = 不过滤，显示全部协议节点。</div>
 						</div>
+						<hr>
+						<div class="proto-container">
+							<strong>剔除中国大陆节点：</strong><br>
+							<label style="margin:8px 0;display:inline-block;white-space:nowrap;">
+								<input type="checkbox" id="nocnCb" ${剔除大陆已开 ? 'checked' : ''}> 剔除名称含「省份/城市/中国/大陆/移动/联通/电信」等关键词的节点（名称含香港/澳门/台湾的不受影响）
+							</label>
+							<div class="save-container">
+								<button class="save-btn" onclick="saveNocn(this)">保存剔除设置</button>
+								<span class="save-status" id="nocnStatus"></span>
+							</div>
+						</div>
 						` : '<p>请绑定 <strong>变量名称</strong> 为 <strong>KV</strong> 的KV命名空间</p>'}
 					</div>
 					<br>
@@ -3709,6 +4048,37 @@ async function KV(request, env, txt = 'ADD.txt', { subscriptionToken, fileName }
 						});
 					}
 
+// 保存「剔除大陆节点」开关
+					function saveNocn(button) {
+						if (!button) return;
+						button.disabled = true;
+						const status = document.getElementById('nocnStatus');
+						const setStatus = (msg, color) => {
+							if (status) { status.textContent = msg; status.style.color = color || '#666'; }
+						};
+						setStatus('保存中...');
+						const cb = document.getElementById('nocnCb');
+						// 保留当前 URL 的 token 等参数,避免经 /?token= 打开的页在保存时丢掉鉴权参数
+					const saveUrl = new URL(window.location.href);
+					saveUrl.search = '';
+					saveUrl.searchParams.set('save', 'nocn');
+					fetch(saveUrl.toString(), {
+							method: 'POST',
+							body: cb && cb.checked ? '1' : '0',
+							headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+							cache: 'no-cache'
+						}).then(res => {
+							if (!res.ok) throw new Error('HTTP error! status: ' + res.status);
+							return res.text();
+						}).then(t => {
+							setStatus('已保存: ' + t, '#4CAF50');
+						}).catch(e => {
+							console.error('保存剔除设置失败:', e);
+							setStatus('保存失败: ' + e.message, 'red');
+						}).finally(() => {
+							button.disabled = false;
+						});
+					}
 						
 					if (document.querySelector('.editor')) {
 						let timer;

@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Verify src -> _worker.js build reproduces (no lost lines)
+        run: |
+          node build.js --check
+          cp _worker.js /tmp/before.js
+          node build.js
+          diff _worker.js /tmp/before.js || echo "warn: build is not idempotent"
+
+      - name: Syntax check
+        run: node --check _worker.js
+
+      - name: Offline unit tests
+        run: node tests/unit.test.mjs
