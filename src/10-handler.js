@@ -360,7 +360,6 @@ export default {
 				}
 				return new Response(base64Data, { headers: responseHeaders });
 			} else if (订阅格式 == 'clash') {
-			} else if (订阅格式 == 'clash') {
 				// ===== 方案A:本地生成 Clash 配置,不依赖第三方 SUBAPI =====
 				// 分流规则优先使用 KV 缓存的 ACL4SSR 规则集,无 KV 时回退内置精简规则
 				const 本地Clash配置 = await 生成本地Clash配置(过滤结果, env, fileName);

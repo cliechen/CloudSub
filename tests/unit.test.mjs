@@ -429,6 +429,71 @@ await t('Worker 聚合缓存:第二次请求不重复拉取上游', async () => 
 	}
 });
 
+await t('Clash 订阅: 正常返回 Clash 配置(回归: 空 else-if 吞掉 clash 分支)', async () => {
+	const TOKEN = '550e8400-e29b-41d4-a716-446655440000';
+	const NODES = [
+		'vless://00000000-0000-0000-0000-000000000000@1.2.3.4:443?type=tcp#vl-01',
+		'trojan://pw@8.8.8.8:443#tj-01',
+		'ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpwYXNz@7.7.7.7:8443#ss-01',
+	].join('\n');
+	const store = new Map([['LINK.txt', NODES]]);
+	const kv = {
+		async get(key) { return store.get(key) || null; },
+		async put(key, value) { store.set(key, String(value)); },
+		async delete(key) { store.delete(key); },
+	};
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async () => { throw new Error('本测试不应拉取上游'); };
+	try {
+		const env = { KV: kv, TOKEN: 'admin', SUBTOKEN: TOKEN };
+		const request = () => new Request('https://worker.example/sub?token=' + TOKEN, {
+			headers: { 'User-Agent': 'ClashForAndroid/2.5.12' },
+		});
+		const res = await worker.fetch(request(), env, { waitUntil() {} });
+		assert.ok(res, 'Clash 订阅不应返回 undefined(空 else-if 回归)');
+		assert.equal(res.status, 200);
+		const text = await res.text();
+		assert.ok(text.includes('proxies:'), '应返回 Clash YAML(含 proxies 段)');
+		assert.ok(text.includes('proxy-groups:'), '应返回 Clash YAML(含 proxy-groups 段)');
+		assert.ok(!text.includes('无可用节点'), '不应为空配置');
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
+await t('Clash 订阅 + 协议过滤: 只保留勾选协议节点', async () => {
+	const TOKEN = '550e8400-e29b-41d4-a716-446655440000';
+	const NODES = [
+		'vless://00000000-0000-0000-0000-000000000000@1.2.3.4:443?type=tcp#vl-01',
+		'trojan://pw@8.8.8.8:443#tj-01',
+		'ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpwYXNz@7.7.7.7:8443#ss-01',
+	].join('\n');
+	const store = new Map([['LINK.txt', NODES], ['PROTOCOL.txt', 'trojan']]);
+	const kv = {
+		async get(key) { return store.get(key) || null; },
+		async put(key, value) { store.set(key, String(value)); },
+		async delete(key) { store.delete(key); },
+	};
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async () => { throw new Error('本测试不应拉取上游'); };
+	try {
+		const env = { KV: kv, TOKEN: 'admin', SUBTOKEN: TOKEN };
+		const request = () => new Request('https://worker.example/sub?token=' + TOKEN, {
+			headers: { 'User-Agent': 'ClashForAndroid/2.5.12' },
+		});
+		const res = await worker.fetch(request(), env, { waitUntil() {} });
+		assert.ok(res, 'Clash 订阅不应返回 undefined');
+		assert.equal(res.status, 200);
+		const text = await res.text();
+		// 协议过滤应先于格式生成生效: 结果里不应再有 vless/ss 节点
+		assert.ok(!text.includes('vl-01'), 'vless 节点应被协议过滤剔除');
+		assert.ok(!text.includes('ss-01'), 'ss 节点应被协议过滤剔除');
+		assert.ok(text.includes('tj-01'), 'trojan 节点应保留');
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
 // ---- 输出汇总 ----
 console.log(`[unit] 通过 ${passed} / ${results.length}`);
 for (const r of results) console.log(r);
