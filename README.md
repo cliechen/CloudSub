@@ -126,7 +126,7 @@
 | LINK | `vless://...`, `vmess://...`, `https://...` | ❌ | 未绑定 KV 时使用：可同时放入多个节点链接与多个订阅链接，链接之间用换行做间隔 |
 | LINKSUB | `https://sub...` | ❌ | 未绑定 KV 时使用：仅填写订阅链接（机场/自建聚合订阅），换行分隔 |
 | PROTOCOL | `vmess,vless,ss` | ❌ | 仅保留指定协议的节点；也可在管理页勾选（存入 KV 的 `PROTOCOL.txt`） |
-| NOCN | `1` / `true` / `on` | ❌ | 剔除「中国大陆」节点。简单规则：节点名称含「省份/直辖市/重点城市/中国/大陆/内地/国内/境内」等地域词，或「移动/联通/电信/天翼/铁通」等运营商词即剔除；名称含香港/澳门/台湾的不受影响。也可在管理页勾选（存入 KV 的 `NOCN.txt`）。值可为 `1`、`true`、`on`、`yes`、`开`、`是` |
+| NOCN | `1` / `true` / `on` | ❌ | 剔除「中国大陆」节点。**本地 GeoIP 优先**：自动从 GitHub（17mon/china_ip_list，KV 缓存 7 天）下载中国 IP 段，服务器为 IP 字面量的节点直接在本地二分匹配（不请求任何第三方 IP 查询接口，域名节点无法本地解析时回退名称关键词）；名称含「省份/城市/中国/大陆/移动/联通/电信」等关键词亦剔除，名称含香港/澳门/台湾的不受影响。也可在管理页勾选（存入 KV 的 `NOCN.txt`）。值可为 `1`、`true`、`on`、`yes`、`开`、`是` |
 | WARP | `warp://...` 或任意节点链接 | ❌ | 追加 WARP 节点到聚合订阅中 |
 | SUBNAME | `CloudSub` | ❌ | 订阅名称 |
 | SUBUPTIME | `6` | ❌ | 客户端订阅自动更新时间（小时），默认 6，范围 1-168 |
@@ -134,6 +134,9 @@
 | SUBMAXSIZE | `10485760` | ❌ | 单个订阅源响应大小上限（字节，默认 10MB）；超大订阅被跳过时在日志中提示调大 |
 | SUBMAXTOTAL | `41943040` | ❌ | 全部订阅源合计响应大小预算（字节，默认 40MB）；超出后按配置顺序跳过靠后的源，避免大源因下载慢被误杀 |
 | SUBMAXTIME | `20000` | ❌ | 单个订阅源拉取超时（毫秒，默认 20 秒） |
+| SUBMAXNODES | `20000` | ❌ | 聚合结果节点行数上限（默认 20000，范围 1-100000）；超大订阅按行截断，避免超过 KV 2MiB 缓存安全上限、每次请求都全量重拉 |
+| EXCLUDE | `bad.example.com` | ❌ | 排除订阅源：按 URL 片段匹配（一行一个，支持逗号/分号分隔），命中即不拉取该源；也可在 KV 存入 `EXCLUDE.txt` |
+| IPINFO | `0` | ❌ | `0` 时 TG 通知不再查询 ip-api.com 归属地（省外部请求、不向第三方暴露访客 IP）；默认查询 |
 | TGTOKEN | `6894123456:XXXXXXXXXX0qExVsBPUhHDAbXXXXXqWXgBA` | ❌ | 发送TG通知的机器人token | 
 | TGID | `6946912345` | ❌ | 接收TG通知的账户数字ID | 
 | TG | `1` | ❌ | 开发者用：`1` 推送所有访问信息，`0`（默认）不推送 | 
@@ -144,6 +147,14 @@
 
 
 ## ⚠️ 注意事项
+- **v2.8.1 起 TG 通知不再阻塞请求**：通知改为后台异步（`ctx.waitUntil`）发送，且统一由 `TG=1` 开关控制（`TG=0` 默认不推送，与变量表一致）；`IPINFO=0` 可关闭通知中的 ip-api 归属地查询；
+- **v2.8.1 起订阅响应支持 ETag/304**：客户端带 `If-None-Match` 且内容未变化时直接返回 304，不再重复生成/编码配置，减少下游重复拉取；
+- **v2.8.1 起显著减少 KV 读取**：`LINK.txt` / `PROTOCOL.txt` / `NOCN.txt` / `EXCLUDE.txt` 等热点键增加 30 秒实例内存缓存（管理页保存时立即失效）；clash/singbox/surge/quanx/loon 格式成品增加秒级内存缓存，大订阅不再每次请求全量重解析生成；
+- **v2.8.1 起构建校验更严格**：`npm run check` 真正校验 `src/` 拼接结果与 `_worker.js` 一致；聚合锁 `SUB_LOCK` 防悬挂（持锁超时后可接管、释放时校验归属）；
+- **v2.8.1 起「剔除大陆节点」升级为本地 GeoIP 匹配**：自动从 GitHub 下载中国 IP 段（17mon/china_ip_list），KV 缓存 7 天 + 实例内存缓存 1 小时，服务器为 IP 字面量的节点直接在本地二分匹配，不再依赖节点名称关键词（机场常给大陆节点起境外名）；全程不请求任何第三方 IP 归属查询接口，域名节点回退名称关键词判断；
+- **v2.8.1 起修复 SS 节点导致 OpenClash/mihomo 无法启动的问题**：SS 插件参数（`obfs`/`v2ray-plugin`）逐项用 `mihomo -t` 实测校准——非法模式（如 `obfs=on`、`v2ray-plugin mode=quic`）会让 mihomo 报 `obfs mode error` 并**拒绝加载整个配置**，现改为整节点丢弃；缺失模式时按惯例默认 `http`/`websocket`；SS cipher 白名单扩充到与 mihomo 支持列表一致（ccm/gcm-siv/chacha8/lea/aegis 等 17 种不再被误丢），并确认 `chacha20-poly1305` 为 mihomo 不支持的名称、保持丢弃；
+- **v2.8.1 起全协议字段按 mihomo 实测校验**（避免单个坏节点拖垮整个配置）：vmess 仅接受 `auto`/`aes-128-gcm`/`chacha20-poly1305`/`none` 四种 cipher、`alterId` 必须为非负整数；hysteria2 `obfs` 仅接受 `salamander` 且必须带 `obfs-password`；hysteria v1 `up`/`down` 必须为正整数（缺省给默认值）；wireguard `ip` 仅接受纯 IPv4、`reserved` 必须恰好 3 字节且每字节 0-255；anytls 数字字段（`idle-session-check-interval` 等）必须为正整数。上述非法值一律整节点丢弃；另容忍 URI 尾部斜杠（如 `hysteria2://pw@host:443/`）不再误丢节点；
+- **v2.8.1 起支持 GitHub Actions 部署**：手动触发 `Deploy to Cloudflare Workers` 工作流即可部署（需在仓库配置 `CLOUDFLARE_API_TOKEN` 与 `CLOUDFLARE_ACCOUNT_ID` secrets）；
 - **v2.7.6 起大订阅拉取更完整**：修复无 `content-length`（分块传输/动态生成）或 gzip 压缩的订阅源被按单源上限过度估算、导致默认预算下只能拉取少量来源的问题；压缩响应不再因声明大小误导被整源丢弃，实际总读取量由流式预算兜底（不超过 `SUBMAXTOTAL`）；
 - **v2.7.2 起订阅源拉取更完整**：单源上限由 5MB 提升至 10MB、合计预算由 20MB 提升至 40MB，且超出合计预算时按配置顺序（而非下载完成先后）跳过靠后的源，大订阅不再因下载慢而被误杀；四个拉取限制均可通过 `SUBMAXSOURCE` / `SUBMAXSIZE` / `SUBMAXTOTAL` / `SUBMAXTIME` 调整。
 - **v2.7.0 起订阅地址变更**：客户端订阅地址为 `/sub?token=<SUBTOKEN>`，`/auto` 仅作为管理页面入口，不再输出订阅内容；

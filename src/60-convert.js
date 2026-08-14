@@ -384,6 +384,12 @@ function uriToClashProxy(uri) {
 					cipher: json.scy || 'auto',
 					udp: true,
 				};
+				// vmess cipher 白名单:mihomo 实测仅支持 auto/aes-128-gcm/chacha20-poly1305/none,
+				// 其余值(常见误配如 ss 的 chacha20-ietf-poly1305)会拒绝加载整个配置,整节点丢弃。
+				const VMESS_CIPHERS = new Set(['auto', 'aes-128-gcm', 'chacha20-poly1305', 'none']);
+				if (json.scy && !VMESS_CIPHERS.has(String(json.scy).toLowerCase())) return null;
+				// alterId 必须为非负整数(实测字符串/NaN 会让 mihomo 拒绝加载整个配置)
+				if (json.aid && !/^\d+$/.test(String(json.aid))) return null;
 				const net = String(json.net || 'tcp').toLowerCase();
 				if (net !== 'tcp') p.network = net;
 				if (net === 'ws') p['ws-opts'] = { path: json.path || '/', headers: json.host ? { Host: json.host } : undefined };
@@ -434,6 +440,9 @@ function uriToClashProxy(uri) {
 		let query = '';
 		if (qIdx !== -1) { query = hostPort.slice(qIdx + 1); hostPort = hostPort.slice(0, qIdx); }
 		const params = new URLSearchParams(query);
+		// 部分机场模板 URI 带尾部斜杠(如 hysteria2://pw@host:443/),
+		// 直接匹配会失败导致节点被误丢,去掉尾部斜杠再解析。
+		hostPort = hostPort.replace(/\/+$/, '');
 		let server = hostPort, port = '';
 		const hm = hostPort.match(/^\[(.+)\]:(\d+)$/) || hostPort.match(/^([^:]+):(\d+)$/);
 		if (hm) { server = hm[1]; port = hm[2]; }
@@ -503,12 +512,22 @@ function uriToClashProxy(uri) {
 				// cipher 白名单:mihomo 对不认识的 cipher 报 initialize error 并使整个配置加载失败
 				// (实测 salsa20/camellia-*/rc4/大写变体均被拒,2022-blake3 需 base64 密码解码为 16/32 字节 key)
 				const normCipher = String(cipher).toLowerCase().trim();
+				// cipher 白名单与 mihomo v1.19.x 实测支持列表一致(逐项用 mihomo -t 验证过);
+				// 注意:chacha20-poly1305 是 mihomo 明确不支持的名称(实测报 cipher not supported),
+				// 不能加入白名单,否则会让整个配置加载失败。
 				const SS_CIPHERS = new Set([
 					'aes-128-gcm', 'aes-192-gcm', 'aes-256-gcm',
-					'chacha20-ietf-poly1305', 'xchacha20-ietf-poly1305',
+					'aes-128-ccm', 'aes-192-ccm', 'aes-256-ccm',
+					'aes-128-gcm-siv', 'aes-256-gcm-siv',
 					'aes-128-cfb', 'aes-192-cfb', 'aes-256-cfb',
-					'rc4-md5', 'chacha20-ietf', 'chacha20', 'none',
 					'aes-128-ctr', 'aes-192-ctr', 'aes-256-ctr',
+					'chacha20-ietf-poly1305', 'xchacha20-ietf-poly1305',
+					'chacha8-ietf-poly1305', 'xchacha8-ietf-poly1305',
+					'chacha20-ietf', 'chacha20', 'xchacha20',
+					'lea-128-gcm', 'lea-192-gcm', 'lea-256-gcm',
+					'rabbit128-poly1305', 'aegis-128l', 'aegis-256',
+					'aez-384', 'deoxys-ii-256-128',
+					'rc4-md5', 'none',
 					'2022-blake3-aes-128-gcm', '2022-blake3-aes-256-gcm', '2022-blake3-chacha20-poly1305',
 				]);
 				if (!SS_CIPHERS.has(normCipher)) return null;
@@ -530,6 +549,12 @@ function uriToClashProxy(uri) {
 							const eq = kv.indexOf('=');
 							if (eq > 0) { const k = kv.slice(0, eq); const v = kv.slice(eq + 1); if (k === 'obfs') opts.mode = v; else if (k === 'obfs-host') opts.host = v; }
 						}
+						// mihomo 的 obfs 仅接受 http/tls 两种模式,缺失时按 simple-obfs 惯例默认 http;
+						// 非法模式(on/off/yes/自定义等)会让 mihomo 报 "obfs mode error" 并拒绝加载整个配置,
+						// 这类节点整条丢弃(宁缺毋滥,不拖垮整份配置)。
+						const 模式 = String(opts.mode || 'http').toLowerCase();
+						if (模式 !== 'http' && 模式 !== 'tls') return null;
+						opts.mode = 模式;
 						p['plugin-opts'] = opts;
 					} else if (parts[0].includes('v2ray')) {
 						p.plugin = 'v2ray-plugin';
@@ -539,6 +564,12 @@ function uriToClashProxy(uri) {
 							if (eq > 0) opts[kv.slice(0, eq)] = kv.slice(eq + 1);
 							else opts[kv.trim()] = true;
 						}
+						// mihomo 的 v2ray-plugin 仅支持 mode=websocket(官方注释 no QUIC now),
+						// 缺失时默认 websocket;非法模式(quic/ws 等)会让 mihomo 报错并拒绝加载整个配置,
+						// 这类节点整条丢弃。
+						const 模式 = String(opts.mode || 'websocket').toLowerCase();
+						if (模式 !== 'websocket') return null;
+						opts.mode = 模式;
 						p['plugin-opts'] = opts;
 					}
 				}
@@ -551,8 +582,16 @@ function uriToClashProxy(uri) {
 				if (params.get('insecure') === '1') p['skip-cert-verify'] = true;
 				if (params.get('up')) p.up = params.get('up');
 				if (params.get('down')) p.down = params.get('down');
-				if (params.get('obfs')) p.obfs = params.get('obfs');
-				if (params.get('obfs-password')) p['obfs-password'] = params.get('obfs-password');
+				// mihomo 的 hysteria2 obfs 仅支持 salamander 且必须带密码;
+				// none/自定义值或缺密码实测都会报错并拒绝加载整个配置,整节点丢弃。
+				const hy2obfs = params.get('obfs');
+				if (hy2obfs) {
+					if (String(hy2obfs).toLowerCase() !== 'salamander') return null;
+					const hy2obfsPw = params.get('obfs-password');
+					if (!hy2obfsPw) return null;
+					p.obfs = 'salamander';
+					p['obfs-password'] = hy2obfsPw;
+				}
 				return p;
 			}
 			case 'hysteria': {
@@ -560,9 +599,13 @@ function uriToClashProxy(uri) {
 				if (params.get('auth')) p['auth_str'] = params.get('auth');
 				if (params.get('peer')) p.sni = params.get('peer');
 				if (params.get('insecure') === '1') p['skip-cert-verify'] = true;
-				// mihomo 的 hysteria v1 必填 up/down,缺失会报 has unset fields 并使整个配置失败,给默认值
-				p.up = params.get('upmbps') || '100';
-				p.down = params.get('downmbps') || '100';
+				// mihomo 的 hysteria v1 必填正整数 up/down,缺失给默认值;
+				// 非数字/小数/0 实测会报错并拒绝加载整个配置,整节点丢弃。
+				const hy1up = params.get('upmbps'), hy1down = params.get('downmbps');
+				if (hy1up && !/^[1-9]\d*$/.test(hy1up)) return null;
+				if (hy1down && !/^[1-9]\d*$/.test(hy1down)) return null;
+				p.up = hy1up || '100';
+				p.down = hy1down || '100';
 				return p;
 			}
 			case 'tuic': {
@@ -587,17 +630,24 @@ function uriToClashProxy(uri) {
 				};
 				const priv = normWgKey(params.get('pvtkey'));
 				if (!priv) return null; // 缺失/非法 private-key:丢弃节点
-				// mihomo 会为 ip 追加 /32 后解析:非法的 ip 报 ip address parse error 并使整个配置失败
+				// mihomo 的 wireguard ip 字段仅接受纯 IPv4:实测 IPv6 / CIDR 后缀 / 前导零 / 越界
+				// (如 10.0.0.2/32、999.999.999.999、01.02.03.04、2001:db8::1)都会报错并拒绝加载整个配置。
 				const rawIp = String(params.get('ip') || '10.0.0.2').trim();
-				const isIpCidr = /^(\d{1,3}\.){3}\d{1,3}(\/\d{1,2})?$/.test(rawIp) || /^[0-9a-fA-F:]+(\/\d{1,3})?$/.test(rawIp);
-				if (!isIpCidr) return null; // 非法 ip:丢弃节点
+				const ipOk = /^(0|[1-9]\d{0,2})(\.(0|[1-9]\d{0,2})){3}$/.test(rawIp)
+					&& rawIp.split('.').every(o => Number(o) <= 255);
+				if (!ipOk) return null; // 非法 ip:丢弃节点
 				const p = { ...base, type: 'wireguard', ip: rawIp };
 				p['private-key'] = priv;
 				const pub = normWgKey(params.get('pubkey'));
 				if (pub) p['public-key'] = pub;
 				const psk = normWgKey(params.get('presharedkey'));
 				if (psk) p['pre-shared-key'] = psk;
-				if (params.get('reserved')) p.reserved = String(params.get('reserved')).split(',').map(Number);
+				// mihomo 的 reserved 必须恰好 3 字节且每字节 0-255(实测 2/4 字节会拒绝加载整个配置)
+				if (params.get('reserved')) {
+					const reserved = String(params.get('reserved')).split(',').map(Number);
+					if (reserved.length !== 3 || reserved.some(n => !Number.isInteger(n) || n < 0 || n > 255)) return null;
+					p.reserved = reserved;
+				}
 				// mtu 必须为正整数,非法值 mihomo 报 cannot parse 'mtu' as int 并使整个配置失败
 				const mtu = Number(params.get('mtu'));
 				if (params.get('mtu') && Number.isInteger(mtu) && mtu > 0) p.mtu = mtu;
@@ -610,9 +660,14 @@ function uriToClashProxy(uri) {
 				if (params.get('sni') || params.get('servername')) p.sni = params.get('sni') || params.get('servername');
 				if (params.get('allowInsecure') === '1') p['skip-cert-verify'] = true;
 				if (params.get('udp') === '1') p.udp = true;
-				if (params.get('idle-session-check-interval')) p['idle-session-check-interval'] = Number(params.get('idle-session-check-interval'));
-				if (params.get('idle-session-timeout')) p['idle-session-timeout'] = Number(params.get('idle-session-timeout'));
-				if (params.get('min-idle-session')) p['min-idle-session'] = Number(params.get('min-idle-session'));
+				// mihomo 的 anytls 数字字段必须是正整数(实测字符串/NaN 会拒绝加载整个配置)
+				for (const key of ['idle-session-check-interval', 'idle-session-timeout', 'min-idle-session']) {
+					const v = params.get(key);
+					if (v) {
+						if (!/^[1-9]\d*$/.test(v)) return null;
+						p[key] = Number(v);
+					}
+				}
 				return p;
 			}
 			case 'socks':

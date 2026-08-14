@@ -27,14 +27,24 @@ async function KV(request, env, txt = 'ADD.txt', { subscriptionToken, fileName }
 				if (url.searchParams.get('save') === 'protocol') {
 					const clean = String(content).split(/[,;\n]+/).map(x => x.trim().toLowerCase()).filter(Boolean).join(',');
 					await env.KV.put('PROTOCOL.txt', clean);
+					热点缓存删('PROTOCOL.txt'); // 同实例内立即生效,无需等 30s 热点缓存过期
 					return new Response("协议过滤设置已保存");
 				}
 				// 剔除大陆节点开关: 使用 ?save=nocn 区分,保存到 NOCN.txt
 				if (url.searchParams.get('save') === 'nocn') {
 					await env.KV.put('NOCN.txt', String(content).trim());
+					热点缓存删('NOCN.txt');
 					return new Response("剔除大陆节点设置已保存");
 				}
+				// 节点屏蔽词: 使用 ?save=blockwords 区分,保存到 BLOCKWORDS.txt
+				if (url.searchParams.get('save') === 'blockwords') {
+					const clean = String(content).split(/[\n,;]+/).map(x => x.trim()).filter(Boolean).join(',');
+					await env.KV.put('BLOCKWORDS.txt', clean);
+					热点缓存删('BLOCKWORDS.txt');
+					return new Response("节点屏蔽词已保存");
+				}
 				await env.KV.put(txt, content);
+				热点缓存删(txt);
 				return new Response("保存成功");
 			} catch (error) {
 				console.error('保存KV时发生错误:', error);
@@ -71,6 +81,13 @@ async function KV(request, env, txt = 'ADD.txt', { subscriptionToken, fileName }
 			try { nocnConfig = await env.KV.get('NOCN.txt') || ''; } catch (e) { nocnConfig = ''; }
 		}
 		const 剔除大陆已开 = /^(1|true|on|yes|开|是)$/i.test(String(nocnConfig || '').trim());
+
+		// 读取「节点屏蔽词」配置(名称含任一关键词的节点剔除;本地地址节点无需配置默认剔除)
+		let blockwordsConfig = '';
+		if (hasKV) {
+			try { blockwordsConfig = await env.KV.get('BLOCKWORDS.txt') || ''; } catch (e) { blockwordsConfig = ''; }
+		}
+		const blockwordsLiteral = escapeJs(blockwordsConfig);
 
 		const safeFileName = escapeHtml(fileName);
 		const safeContent = '';
@@ -282,6 +299,17 @@ async function KV(request, env, txt = 'ADD.txt', { subscriptionToken, fileName }
 								<span class="save-status" id="nocnStatus"></span>
 							</div>
 						</div>
+						<hr>
+						<div class="proto-container">
+							<strong>屏蔽警示/占位节点关键词：</strong><br>
+							<div style="font-size:12px;color:#888;margin:6px 0;">服务器为本地地址(127.x/0.0.0.0/localhost)的节点默认剔除,无需配置;此处填写节点名称关键词(如「防范境外势力渗透」),名称命中即剔除,逗号/换行分隔。内置默认词:防范境外势力、境外势力、中间替换、非法用途、请勿用于、已被劫持、勿用于</div>
+							<textarea id="blockwordsInput" class="editor" style="height:80px;" placeholder="防范境外势力渗透,已被劫持"></textarea>
+							<div class="save-container">
+								<button class="save-btn" onclick="saveBlockwords(this)">保存屏蔽词</button>
+								<span class="save-status" id="blockwordsStatus"></span>
+							</div>
+						</div>
+						<script>if(document.getElementById('blockwordsInput')) document.getElementById('blockwordsInput').value = ${blockwordsLiteral};</script>
 						` : '<p>请绑定 <strong>变量名称</strong> 为 <strong>KV</strong> 的KV命名空间</p>'}
 					</div>
 					<br>
@@ -323,10 +351,14 @@ async function KV(request, env, txt = 'ADD.txt', { subscriptionToken, fileName }
 							if (status) { status.textContent = msg; status.style.color = color || '#666'; }
 						};
 						setStatus('保存中...');
-						fetch(window.location.pathname + '?save=protocol', {
+						// 保留当前 URL 的 token 等参数,避免经 /?token= 打开的页在保存时丢掉鉴权参数
+						const saveUrl = new URL(window.location.href);
+						saveUrl.search = '';
+						saveUrl.searchParams.set('save', 'protocol');
+						fetch(saveUrl.toString(), {
 							method: 'POST',
 							body: collectProtocols(),
-							headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+							headers: { 'Content-Type': 'text/plain;charset=UTF-8', 'Accept': 'text/html' },
 							cache: 'no-cache'
 						}).then(res => {
 							if (!res.ok) throw new Error('HTTP error! status: ' + res.status);
@@ -358,7 +390,7 @@ async function KV(request, env, txt = 'ADD.txt', { subscriptionToken, fileName }
 					fetch(saveUrl.toString(), {
 							method: 'POST',
 							body: cb && cb.checked ? '1' : '0',
-							headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+							headers: { 'Content-Type': 'text/plain;charset=UTF-8', 'Accept': 'text/html' },
 							cache: 'no-cache'
 						}).then(res => {
 							if (!res.ok) throw new Error('HTTP error! status: ' + res.status);
@@ -367,6 +399,38 @@ async function KV(request, env, txt = 'ADD.txt', { subscriptionToken, fileName }
 							setStatus('已保存: ' + t, '#4CAF50');
 						}).catch(e => {
 							console.error('保存剔除设置失败:', e);
+							setStatus('保存失败: ' + e.message, 'red');
+					}).finally(() => {
+						button.disabled = false;
+					});
+					}
+
+// 保存「节点屏蔽词」
+					function saveBlockwords(button) {
+						if (!button) return;
+						button.disabled = true;
+						const status = document.getElementById('blockwordsStatus');
+						const setStatus = (msg, color) => {
+							if (status) { status.textContent = msg; status.style.color = color || '#666'; }
+						};
+						setStatus('保存中...');
+						const input = document.getElementById('blockwordsInput');
+						// 保留当前 URL 的 token 等参数,避免经 /?token= 打开的页在保存时丢掉鉴权参数
+						const saveUrl = new URL(window.location.href);
+						saveUrl.search = '';
+						saveUrl.searchParams.set('save', 'blockwords');
+						fetch(saveUrl.toString(), {
+							method: 'POST',
+							body: (input && input.value) || '',
+							headers: { 'Content-Type': 'text/plain;charset=UTF-8', 'Accept': 'text/html' },
+							cache: 'no-cache'
+						}).then(res => {
+							if (!res.ok) throw new Error('HTTP error! status: ' + res.status);
+							return res.text();
+						}).then(t => {
+							setStatus('已保存: ' + t, '#4CAF50');
+						}).catch(e => {
+							console.error('保存屏蔽词失败:', e);
 							setStatus('保存失败: ' + e.message, 'red');
 						}).finally(() => {
 							button.disabled = false;
@@ -442,7 +506,8 @@ async function KV(request, env, txt = 'ADD.txt', { subscriptionToken, fileName }
 										method: 'POST',
 										body: newContent,
 										headers: {
-											'Content-Type': 'text/plain;charset=UTF-8'
+											'Content-Type': 'text/plain;charset=UTF-8',
+											'Accept': 'text/html'
 										},
 										cache: 'no-cache'
 									})

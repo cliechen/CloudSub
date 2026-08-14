@@ -583,7 +583,7 @@ function clashToLoonProxy(p) {
 			peer.push('allowed-ips="0.0.0.0/0"');
 			peer.push('endpoint=' + server + ':' + port);
 			args.push('peers=[{' + peer.join(',') + '}]');
-			args.push('keeyalive=45');
+			args.push('keepalive=45');
 			return displayName + ' = ' + args.join(',');
 		}
 		case 'http': {
@@ -616,8 +616,9 @@ async function 生成本地Loon配置(节点文本, env, fileName = DEFAULT_FILE
 	const proxies = [];
 	const names = [];
 	for (const line of lines) {
-		const p = uriToClashProxy(line);
-		if (!p) continue;
+		let p;
+		try { p = uriToClashProxy(line); } catch (e) { p = null; } // 单节点解析失败只跳过该节点
+		if (!p || !校验节点(p)) continue; // 协议级校验:不合格节点宁缺毋滥(与其他格式生成器一致)
 		const pr = clashToLoonProxy(p);
 		if (!pr) continue;
 		proxies.push(pr);

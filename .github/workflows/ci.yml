@@ -31,3 +31,28 @@ jobs:
 
       - name: Offline unit tests
         run: node tests/unit.test.mjs
+
+  online:
+    name: Online subscription test (manual)
+    # 联网拉取真实订阅源,仅在手动触发时运行(需要 test/sub_sources.txt 存在)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build
+        run: node build.js
+
+      - name: Run online tests (needs test/sub_sources.txt)
+        run: |
+          if [ ! -f test/sub_sources.txt ]; then
+            echo "test/sub_sources.txt 不存在,跳过。把订阅源写入该文件后重新手动触发。"
+            exit 0
+          fi
+          node test/test_subscription.mjs

@@ -39,14 +39,25 @@ async function nginx() {
 	return text;
 }
 
-async function sendMessage(type, ip, add_data = "", botToken = '', chatID = '') {
+async function sendMessage(type, ip, add_data = "", botToken = '', chatID = '', skipIpLookup = false) {
 	if (botToken !== '' && chatID !== '') {
 		let msg = "";
-		const response = await fetch(`https://ip-api.com/json/${encodeURIComponent(ip || '')}?lang=zh-CN`, { signal: AbortSignal.timeout(3000) });
-		if (response.status == 200) {
-			const ipInfo = await response.json();
-			msg = `${telegramEscape(type)}\nIP: ${telegramEscape(ip)}\n国家: ${telegramEscape(ipInfo.country)}\n<tg-spoiler>城市: ${telegramEscape(ipInfo.city)}\n组织: ${telegramEscape(ipInfo.org)}\nASN: ${telegramEscape(ipInfo.as)}\n${telegramEscape(add_data)}`;
+		// 通知改为后台异步(ctx.waitUntil)发送后,此处任何失败都不应影响主流程:
+		// ip-api 查询超时/失败时降级为不带归属地的消息,不再向上抛异常。
+		if (!skipIpLookup) {
+			try {
+				const response = await fetch(`https://ip-api.com/json/${encodeURIComponent(ip || '')}?lang=zh-CN`, { signal: AbortSignal.timeout(3000) });
+				if (response.status == 200) {
+					const ipInfo = await response.json();
+					msg = `${telegramEscape(type)}\nIP: ${telegramEscape(ip)}\n国家: ${telegramEscape(ipInfo.country)}\n<tg-spoiler>城市: ${telegramEscape(ipInfo.city)}\n组织: ${telegramEscape(ipInfo.org)}\nASN: ${telegramEscape(ipInfo.as)}\n${telegramEscape(add_data)}`;
+				} else {
+					msg = `${telegramEscape(type)}\nIP: ${telegramEscape(ip)}\n<tg-spoiler>${telegramEscape(add_data)}`;
+				}
+			} catch (e) {
+				msg = `${telegramEscape(type)}\nIP: ${telegramEscape(ip)}\n<tg-spoiler>${telegramEscape(add_data)}`;
+			}
 		} else {
+			// IPINFO=0:不查询第三方归属地,不向 ip-api.com 暴露访客 IP
 			msg = `${telegramEscape(type)}\nIP: ${telegramEscape(ip)}\n<tg-spoiler>${telegramEscape(add_data)}`;
 		}
 
