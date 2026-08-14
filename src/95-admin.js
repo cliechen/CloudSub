@@ -27,14 +27,17 @@ async function KV(request, env, txt = 'ADD.txt', { subscriptionToken, fileName }
 				if (url.searchParams.get('save') === 'protocol') {
 					const clean = String(content).split(/[,;\n]+/).map(x => x.trim().toLowerCase()).filter(Boolean).join(',');
 					await env.KV.put('PROTOCOL.txt', clean);
+					热点缓存删('PROTOCOL.txt'); // 同实例内立即生效,无需等 30s 热点缓存过期
 					return new Response("协议过滤设置已保存");
 				}
 				// 剔除大陆节点开关: 使用 ?save=nocn 区分,保存到 NOCN.txt
 				if (url.searchParams.get('save') === 'nocn') {
 					await env.KV.put('NOCN.txt', String(content).trim());
+					热点缓存删('NOCN.txt');
 					return new Response("剔除大陆节点设置已保存");
 				}
 				await env.KV.put(txt, content);
+				热点缓存删(txt);
 				return new Response("保存成功");
 			} catch (error) {
 				console.error('保存KV时发生错误:', error);
@@ -323,10 +326,14 @@ async function KV(request, env, txt = 'ADD.txt', { subscriptionToken, fileName }
 							if (status) { status.textContent = msg; status.style.color = color || '#666'; }
 						};
 						setStatus('保存中...');
-						fetch(window.location.pathname + '?save=protocol', {
+						// 保留当前 URL 的 token 等参数,避免经 /?token= 打开的页在保存时丢掉鉴权参数
+						const saveUrl = new URL(window.location.href);
+						saveUrl.search = '';
+						saveUrl.searchParams.set('save', 'protocol');
+						fetch(saveUrl.toString(), {
 							method: 'POST',
 							body: collectProtocols(),
-							headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+							headers: { 'Content-Type': 'text/plain;charset=UTF-8', 'Accept': 'text/html' },
 							cache: 'no-cache'
 						}).then(res => {
 							if (!res.ok) throw new Error('HTTP error! status: ' + res.status);
@@ -358,7 +365,7 @@ async function KV(request, env, txt = 'ADD.txt', { subscriptionToken, fileName }
 					fetch(saveUrl.toString(), {
 							method: 'POST',
 							body: cb && cb.checked ? '1' : '0',
-							headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+							headers: { 'Content-Type': 'text/plain;charset=UTF-8', 'Accept': 'text/html' },
 							cache: 'no-cache'
 						}).then(res => {
 							if (!res.ok) throw new Error('HTTP error! status: ' + res.status);
@@ -442,7 +449,8 @@ async function KV(request, env, txt = 'ADD.txt', { subscriptionToken, fileName }
 										method: 'POST',
 										body: newContent,
 										headers: {
-											'Content-Type': 'text/plain;charset=UTF-8'
+											'Content-Type': 'text/plain;charset=UTF-8',
+											'Accept': 'text/html'
 										},
 										cache: 'no-cache'
 									})

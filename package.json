@@ -1,6 +1,6 @@
 {
 	"name": "cloudsub",
-	"version": "2.7.6",
+	"version": "2.8.1",
 	"description": "自建汇聚订阅 CloudSub - Cloudflare Workers 订阅聚合(多节点/多订阅合并为单一链接)",
 	"private": true,
 	"type": "module",

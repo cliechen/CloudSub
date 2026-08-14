@@ -2,7 +2,7 @@
 // TOKEN 仅用于管理页面；SUBTOKEN/SUBUUID 用于客户端订阅请求。
 
 const DEFAULT_TOKEN = 'auto';
-const DEPLOY_VERSION = 'v2.7.6';
+const DEPLOY_VERSION = 'v2.8.1';
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const DEFAULT_FILE_NAME = 'CloudSub';
 const DEFAULT_UPDATE_TIME = 6;
@@ -20,6 +20,10 @@ const DEFAULT_MAX_SUB_SOURCES = 50;
 const DEFAULT_MAX_SUB_RESPONSE_BYTES = 10 * 1024 * 1024;
 const DEFAULT_MAX_SUB_TOTAL_BYTES = 40 * 1024 * 1024;
 const DEFAULT_SUB_FETCH_TIMEOUT_MS = 20000;
+// 聚合结果节点行数上限(默认 20000)。超大订阅(数万节点)会撑爆 KV 2MiB 缓存上限
+// 导致每次请求都全量重拉,这里按行数截断,保证缓存可用且响应可控。
+const DEFAULT_MAX_SUB_NODES = 20000;
+const HARD_MAX_SUB_NODES = 100000;
 const MAX_KV_CONTENT_BYTES = 2 * 1024 * 1024;
 // 环境变量可配置值的硬上限(避免误配导致 Worker 内存超限,免费版内存为 128MB)
 const HARD_MAX_SUB_RESPONSE_BYTES = 32 * 1024 * 1024;
@@ -49,6 +53,50 @@ function 内存缓存放(key, value) {
 	内存缓存.set(key, { value, expireAt: Date.now() + 内存TTL秒 * 1000 });
 }
 
+// ===== 热点键内存缓存(低频变更的 KV 键,如 LINK.txt / PROTOCOL.txt / NOCN.txt / EXCLUDE.txt) =====
+// 这些键每次请求都会被读取,而内容极少变化,30 秒内存缓存可显著减少 KV 读取次数;
+// 管理页保存时会主动失效(热点缓存删),因此编辑后同实例内立即生效,KV 跨实例传播延迟可接受。
+const 热点缓存 = new Map(); // key -> { value, expireAt }
+const 热点TTL毫秒 = 30 * 1000;
+function 热点缓存取(key) {
+	const e = 热点缓存.get(key);
+	if (!e) return undefined;
+	if (Date.now() > e.expireAt) { 热点缓存.delete(key); return undefined; }
+	return e.value;
+}
+function 热点缓存存(key, value) {
+	if (热点缓存.size >= 256) { // 简单清理过期项,防止无限增长
+		for (const [k, v] of 热点缓存) { if (Date.now() > v.expireAt) 热点缓存.delete(k); }
+	}
+	热点缓存.set(key, { value, expireAt: Date.now() + 热点TTL毫秒 });
+}
+function 热点缓存删(key) { 热点缓存.delete(key); }
+async function 热点KV读(env, key) {
+	const hit = 热点缓存取(key);
+	if (hit !== undefined) return hit;
+	let v = null;
+	try { v = await env.KV.get(key); } catch (e) { v = null; }
+	热点缓存存(key, v);
+	return v;
+}
+
+// 旧键(/LINK.txt)数据迁移只需每实例执行一次,避免每次请求都做两次 KV 读取
+let 迁移已执行 = false;
+
+// ===== 格式成品内存缓存 =====
+// 聚合缓存(SUB_AGG)保存的是节点文本,clash/singbox/surge/qx/loon 的成品配置此前每次请求都全量重生成;
+// 这里按「缓存键 + 格式 + 订阅名」对成品做秒级内存缓存,大幅减少大订阅下的重复解析/生成开销。
+// 强制刷新(&refresh)时跳过缓存,且 执行聚合刷新 产生新结果时会清空全部 FMT:* 条目,保证不返回旧格式配置。
+async function 生成配置缓存(键, fn, 强制 = false) {
+	if (!强制) {
+		const v = 内存缓存取(键);
+		if (v != null) return v;
+	}
+	const v = await fn();
+	内存缓存放(键, v);
+	return v;
+}
+
 // ===== 订阅源条件请求凭据(ETag / Last-Modified)存取 =====
 // 用于“有变化才下载”:后台刷新带上上次 ETag,上游返回 304 则不下载 body。
 async function 读取源条件(env, urls) {
@@ -76,7 +124,7 @@ async function 保存源条件(env, 新表, ttlHours = 24) {
 // ===== 执行一次聚合刷新并写缓存 =====
 // 使用条件请求(ETag)实现“有变化才下载”:多数刷新周期源未变化(304)时不下载 body。
 // 返回新的 过滤结果;若全部源都未变化且存在可复用的旧缓存,则“不下载、不重建、仅续期”,返回 null。
-async function 执行聚合刷新({ MainData, 订阅链接数组, 协议过滤, 剔除大陆, WARP, env, request, 追加UA, userAgentHeader, fileName, 拉取限制, KV缓存键, 时间戳键, SUBUpdateTime, 写缓存, 旧缓存 }) {
+async function 执行聚合刷新({ MainData, 订阅链接数组, 协议过滤, 剔除大陆, 中国IP数据, WARP, env, request, 追加UA, userAgentHeader, fileName, 拉取限制, KV缓存键, 时间戳键, SUBUpdateTime, 写缓存, 旧缓存 }) {
 	const etags = await 读取源条件(env, 订阅链接数组);
 	const 标记 = {};
 	let req_data = MainData;
@@ -110,7 +158,12 @@ async function 执行聚合刷新({ MainData, 订阅链接数组, 协议过滤, 
 	//去重 + 按协议过滤 (+ 可选剔除大陆节点)
 	const text = new TextDecoder().decode(new TextEncoder().encode(req_data));
 	let 过滤结果 = 过滤协议节点(节点去重(text), 协议过滤);
-	if (剔除大陆) 过滤结果 = 剔除大陆节点(过滤结果);
+	if (剔除大陆) 过滤结果 = 剔除大陆节点(过滤结果, 中国IP数据 || null);
+	// 节点行数上限(SUBMAXNODES):超大订阅按行截断,保证 KV 缓存不超 2MiB 上限、响应可控
+	if (拉取限制 && 拉取限制.nodes && 拉取限制.nodes > 0) {
+		const 行 = 过滤结果.split('\n');
+		if (行.length > 拉取限制.nodes) 过滤结果 = 行.slice(0, 拉取限制.nodes).join('\n');
+	}
 
 	if (写缓存 && env.KV && 过滤结果) {
 		const bytes = new TextEncoder().encode(过滤结果).byteLength;
@@ -124,6 +177,10 @@ async function 执行聚合刷新({ MainData, 订阅链接数组, 协议过滤, 
 		} else {
 			console.error(`聚合结果超过项目 KV 缓存安全上限,跳过缓存: ${KV缓存键}, ${bytes} 字节`);
 		}
+	}
+	// 新聚合结果已生成:清掉按旧结果生成的格式成品缓存(FMT:*),避免后续请求复用旧格式配置
+	if (写缓存) {
+		for (const k of 内存缓存.keys()) { if (k.startsWith('FMT:')) 内存缓存.delete(k); }
 	}
 	内存缓存放(KV缓存键, 过滤结果);
 	return 过滤结果;
@@ -179,6 +236,9 @@ export default {
 		const BotToken = env.TGTOKEN || '';
 		const ChatID = env.TGID || '';
 		const TG = Number(env.TG || 0);
+		// 通知开关统一由 TG=1 控制(与 README 变量表一致);IPINFO=0 时通知不再查询 ip-api.com 归属地
+		const 推送通知 = TG === 1;
+		const 跳过IP归属 = String(env.IPINFO || '') === '0';
 		const fileName = String(env.SUBNAME || DEFAULT_FILE_NAME).slice(0, 80);
 		const SUBUpdateTime = Math.min(168, Math.max(1, Number(env.SUBUPTIME) || DEFAULT_UPDATE_TIME));
 
@@ -188,6 +248,7 @@ export default {
 			perSource: Math.min(HARD_MAX_SUB_RESPONSE_BYTES, Math.max(1, Number(env.SUBMAXSIZE) || DEFAULT_MAX_SUB_RESPONSE_BYTES)),
 			total: Math.min(HARD_MAX_SUB_TOTAL_BYTES, Math.max(1, Number(env.SUBMAXTOTAL) || DEFAULT_MAX_SUB_TOTAL_BYTES)),
 			timeout: Math.min(HARD_MAX_SUB_TIMEOUT_MS, Math.max(1000, Number(env.SUBMAXTIME) || DEFAULT_SUB_FETCH_TIMEOUT_MS)),
+			nodes: Math.min(HARD_MAX_SUB_NODES, Math.max(1, Number(env.SUBMAXNODES) || DEFAULT_MAX_SUB_NODES)),
 		};
 
 		let MainData = DEFAULT_MAIN_DATA;
@@ -196,11 +257,14 @@ export default {
 		const isPathAdminAuth = url.pathname === `/${adminToken}`;
 		const isAdminAuth = token === adminToken || isPathAdminAuth;
 		const isSubscriptionAuth = token === subscriptionToken;
-		const isManagementRequest = isAdminAuth && userAgent.includes('mozilla') && (
+		// 管理页识别:浏览器 UA 或 Accept: text/html 任一满足即可(UA 可伪造,Accept 更贴近真实页面请求);
+		// 管理页内保存请求均带 Accept: text/html,详见 95-admin.js。
+		const isManagementRequest = isAdminAuth && (userAgent.includes('mozilla') || String(request.headers.get('Accept') || '').toLowerCase().includes('text/html')) && (
 			isPathAdminAuth || (token === adminToken && url.pathname === '/') || (url.searchParams.get('save') === 'protocol' && isAdminAuth)
 		);
 		if (!(isAdminAuth || isSubscriptionAuth)) {
-			if (TG === 1 && url.pathname !== "/" && url.pathname !== "/favicon.ico") await sendMessage(`#异常访问 ${fileName}`, request.headers.get('CF-Connecting-IP'), `UA: ${userAgent}</tg-spoiler>\n域名: ${url.hostname}\n<tg-spoiler>入口: ${url.pathname}</tg-spoiler>`, BotToken, ChatID);
+			// 通知改为后台异步(ctx.waitUntil)发送,不再阻塞请求响应
+			if (推送通知 && url.pathname !== "/" && url.pathname !== "/favicon.ico") ctx.waitUntil(sendMessage(`#异常访问 ${fileName}`, request.headers.get('CF-Connecting-IP'), `UA: ${userAgent}</tg-spoiler>\n域名: ${url.hostname}\n<tg-spoiler>入口: ${url.pathname}</tg-spoiler>`, BotToken, ChatID, 跳过IP归属));
 			if (env.URL302) return Response.redirect(env.URL302, 302);
 			else if (env.URL) return await proxyURL(env.URL, url);
 			else return new Response(await nginx(), {
@@ -215,14 +279,13 @@ export default {
 			}
 			if (!['GET', 'HEAD'].includes(request.method) && !(isManagementRequest && request.method === 'POST')) {
 				return new Response('Method Not Allowed', { status: 405, headers: { 'Allow': 'GET, HEAD' } });
-			}
-			if (env.KV) {
-				await 迁移地址列表(env, 'LINK.txt');
+			}			if (env.KV) {
+				if (!迁移已执行) { await 迁移地址列表(env, 'LINK.txt'); 迁移已执行 = true; }
 				if (isManagementRequest) {
-					await sendMessage(`#编辑订阅 ${fileName}`, request.headers.get('CF-Connecting-IP'), `UA: ${userAgentHeader}</tg-spoiler>\n域名: ${url.hostname}\n<tg-spoiler>入口: ${url.pathname}</tg-spoiler>`, BotToken, ChatID);
+					if (推送通知) ctx.waitUntil(sendMessage(`#编辑订阅 ${fileName}`, request.headers.get('CF-Connecting-IP'), `UA: ${userAgentHeader}</tg-spoiler>\n域名: ${url.hostname}\n<tg-spoiler>入口: ${url.pathname}</tg-spoiler>`, BotToken, ChatID, 跳过IP归属));
 					return await KV(request, env, 'LINK.txt', { subscriptionToken, fileName });
 				} else {
-						MainData = await env.KV.get('LINK.txt') || '';
+					MainData = await 热点KV读(env, 'LINK.txt') || '';
 				}
 			} else {
 				MainData = env.LINK || '';
@@ -231,7 +294,7 @@ export default {
 			// 读取协议过滤配置(用于最后合成大订阅时按协议勾选显示)
 			// 来源: KV 命名空间 PROTOCOL.txt,或环境变量 PROTOCOL。值为逗号/分号/换行分隔的协议名列表
 			const 协议过滤 = new Set();
-			const 协议过滤配置 = env.KV ? await env.KV.get('PROTOCOL.txt') : (env.PROTOCOL || '');
+			const 协议过滤配置 = env.KV ? await 热点KV读(env, 'PROTOCOL.txt') : (env.PROTOCOL || '');
 			if (协议过滤配置) {
 				for (const p of String(协议过滤配置).split(/[,;\n]+/)) {
 					const t = p.trim().toLowerCase();
@@ -240,7 +303,13 @@ export default {
 			}
 			// 读取「剔除大陆节点」开关(可选项)
 			// 来源: KV 命名空间 NOCN.txt,或环境变量 NOCN。值为 1/true/on/yes/开/是 时启用。
-			const 剔除大陆 = /^(1|true|on|yes|开|是)$/i.test(String((env.KV ? await env.KV.get('NOCN.txt') : (env.NOCN || '')) || '').trim());
+			const 剔除大陆 = /^(1|true|on|yes|开|是)$/i.test(String((env.KV ? await 热点KV读(env, 'NOCN.txt') : (env.NOCN || '')) || '').trim());
+			// 本地 GeoIP 中国 IP 段数据(KV 缓存,零第三方 IP 查询接口);域名节点仍走名称关键词回退
+			const 中国IP数据 = 剔除大陆 ? await 获取中国IP数据(env) : null;
+			// 排除订阅源:按 URL 片段匹配(一行一个,支持逗号/分号分隔),命中即不拉取该源
+			// 来源: KV 命名空间 EXCLUDE.txt,或环境变量 EXCLUDE。
+			const 排除配置 = env.KV ? await 热点KV读(env, 'EXCLUDE.txt') : (env.EXCLUDE || '');
+			const 排除列表 = String(排除配置 || '').split(/[\n,;]+/).map(s => s.trim()).filter(s => s.length >= 4);
 
 			let 重新汇总所有链接 = await ADD(MainData + '\n' + urls.join('\n'));
 			let 自建节点 = "";
@@ -259,7 +328,8 @@ export default {
 			}
 			MainData = 自建节点;
 			urls = await ADD(订阅链接);
-			await sendMessage(`#获取订阅 ${fileName}`, request.headers.get('CF-Connecting-IP'), `UA: ${userAgentHeader}</tg-spoiler>\n域名: ${url.hostname}\n<tg-spoiler>入口: ${url.pathname}</tg-spoiler>`, BotToken, ChatID);
+			// 通知后台异步发送,不阻塞订阅响应
+			if (推送通知) ctx.waitUntil(sendMessage(`#获取订阅 ${fileName}`, request.headers.get('CF-Connecting-IP'), `UA: ${userAgentHeader}</tg-spoiler>\n域名: ${url.hostname}\n<tg-spoiler>入口: ${url.pathname}</tg-spoiler>`, BotToken, ChatID, 跳过IP归属));
 			const isSubConverterRequest = request.headers.get('subconverter-request') || request.headers.get('subconverter-version') || userAgent.includes('subconverter');
 			let 订阅格式 = 'base64';
 			if (!(userAgent.includes('null') || isSubConverterRequest || userAgent.includes('nekobox') || userAgent.includes(('CloudSub').toLowerCase()))) {
@@ -285,7 +355,7 @@ export default {
 			else if (url.searchParams.has('quanx')) 追加UA = 'Quantumult%20X';
 			else if (url.searchParams.has('loon')) 追加UA = 'Loon';
 
-			const 订阅链接数组 = [...new Set(urls)].filter(item => item?.trim?.()).slice(0, 拉取限制.sources); // 去重并限制来源数量
+			const 订阅链接数组 = [...new Set(urls)].filter(item => item?.trim?.()).filter(u => !排除列表.some(e => u.includes(e))).slice(0, 拉取限制.sources); // 去重、排除指定源并限制来源数量
 
 			// ===== 聚合结果缓存(性能优化) =====
 			// 把「聚合、去重、按协议过滤后的最终节点文本」按 自建节点+订阅源列表+协议过滤+WARP
@@ -297,12 +367,13 @@ export default {
 			//     ETag/Last-Modified 刷新——上游全 304 则“不下载、不重建、仅续期”,真正变化才下载;
 			//  4) 防惊群锁:缓存 cold 时仅一个请求承担全量拉取,其余等待读取结果。
 			// 追加 &refresh 强制重建;未绑定 KV 时退化为实时聚合。
-			const 缓存因子 = [MainData, 订阅链接数组.join('\n'), [...协议过滤].sort().join(','), env.WARP || '', 剔除大陆 ? '1' : '0'].join('\u0001');
+			// 缓存因子附带中国 IP 数据版本:IP 段更新后自动生成新缓存键,避免复用旧 GeoIP 结果
+			const 缓存因子 = [MainData, 订阅链接数组.join('\n'), [...协议过滤].sort().join(','), env.WARP || '', 剔除大陆 ? '1:' + (中国IP数据?.版本 || '0') : '0'].join('\u0001');
 			const 缓存键 = await hashText(缓存因子);
 			const KV缓存键 = 'SUB_AGG:' + 缓存键;
 			const 时间戳键 = 'SUB_AGG_AT:' + 缓存键;
 			const 强制刷新 = url.searchParams.has('refresh');
-			const 刷新参数 = { MainData, 订阅链接数组, 协议过滤, 剔除大陆, WARP: env.WARP || '', env, request, 追加UA, userAgentHeader, fileName, 拉取限制, KV缓存键, 时间戳键, SUBUpdateTime };
+			const 刷新参数 = { MainData, 订阅链接数组, 协议过滤, 剔除大陆, 中国IP数据, WARP: env.WARP || '', env, request, 追加UA, userAgentHeader, fileName, 拉取限制, KV缓存键, 时间戳键, SUBUpdateTime };
 
 			// 1) 实例内存热缓存
 			let 过滤结果 = (!强制刷新) ? 内存缓存取(KV缓存键) : null;
@@ -322,23 +393,33 @@ export default {
 				}
 			} else {
 				// 4) 缓存 cold 或强制刷新:以防惊群锁方式同步重建
-				const 锁键 = 'SUB_LOCK:' + 缓存键;
-				let 拿锁 = false;
-				try {
-					if (env.KV) {
-						const 已有锁 = await env.KV.get(锁键);
-						if (!已有锁) {
-							await env.KV.put(锁键, String(Date.now()), { expirationTtl: 120 });
-							拿锁 = true;
-						}
-					} else { 拿锁 = true; }
-				} catch (e) { 拿锁 = true; } // 无 KV 或失败则直接在本请求内重建
-				if (拿锁) {
-					try {
-						过滤结果 = await 执行聚合刷新({ ...刷新参数, 写缓存: !!env.KV, 旧缓存: null });
-					} finally {
-						if (env.KV) { try { await env.KV.delete(锁键); } catch (e) { /* 忽略 */ } }
+			const 锁键 = 'SUB_LOCK:' + 缓存键;
+			let 拿锁 = false;
+			let 我的锁值 = '';
+			try {
+				if (env.KV) {
+					// KV 无 CAS:锁值 = 时间戳 + 实例随机值。持锁者崩溃/超时后锁会悬挂,
+					// 超过 90 秒视为失效可接管;释放时校验值归属,避免误删他人新锁。
+					const 已有锁 = await env.KV.get(锁键);
+					const 锁龄 = 已有锁 ? Date.now() - Number(String(已有锁).split(':')[0] || 0) : Infinity;
+					if (!已有锁 || 锁龄 > 90 * 1000) {
+						我的锁值 = Date.now() + ':' + Math.random().toString(36).slice(2);
+						await env.KV.put(锁键, 我的锁值, { expirationTtl: 120 });
+						拿锁 = true;
 					}
+				} else { 拿锁 = true; }
+			} catch (e) { 拿锁 = true; } // 无 KV 或失败则直接在本请求内重建
+			if (拿锁) {
+				try {
+					过滤结果 = await 执行聚合刷新({ ...刷新参数, 写缓存: !!env.KV, 旧缓存: null });
+				} finally {
+					if (env.KV && 我的锁值) {
+						try {
+							const 现值 = await env.KV.get(锁键);
+							if (现值 === 我的锁值) await env.KV.delete(锁键);
+						} catch (e) { /* 忽略 */ }
+					}
+				}
 				} else if (env.KV) {
 					// 其它请求正在重建:短等待后读取 KV 结果(最多约 4 次)
 					for (let i = 0; i < 4 && !过滤结果; i++) {
@@ -367,6 +448,22 @@ export default {
 				//"Subscription-Userinfo": `upload=${UD}; download=${UD}; total=${total}; expire=${expire}`,
 			};
 
+			// ===== 订阅响应 ETag:支持客户端条件请求 =====
+			// ETag 取「过滤结果 + 格式」的哈希:内容或格式变化时 ETag 才变化;
+			// 客户端带 If-None-Match 且未变化时直接返回 304,不重复生成/编码配置。
+			const 内容ETag = '"' + await hashText(过滤结果 + ':' + 订阅格式) + '"';
+			responseHeaders["ETag"] = 内容ETag;
+			if (request.headers.get('If-None-Match') === 内容ETag) {
+				return new Response(null, {
+					status: 304,
+					headers: {
+						"ETag": 内容ETag,
+						"Cache-Control": "no-store",
+						"Profile-Update-Interval": `${SUBUpdateTime}`,
+					},
+				});
+			}
+
 			if (订阅格式 == 'base64') {
 				// 仅 base64 需编码(懒计算):clash/singbox/surge/qx/loon 等不走此分支,
 				// 避免对 2MB 级大订阅每次做一次无谓的 base64 编码。
@@ -394,34 +491,34 @@ export default {
 			} else if (订阅格式 == 'clash') {
 				// ===== 方案A:本地生成 Clash 配置,不依赖第三方 SUBAPI =====
 				// 分流规则优先使用 KV 缓存的 ACL4SSR 规则集,无 KV 时回退内置精简规则
-				const 本地Clash配置 = await 生成本地Clash配置(过滤结果, env, fileName);
+				const 本地Clash配置 = await 生成配置缓存('FMT:' + 缓存键 + ':clash:' + fileName, () => 生成本地Clash配置(过滤结果, env, fileName), 强制刷新);
 				if (!userAgent.includes('mozilla')) responseHeaders["Content-Disposition"] = `attachment; filename*=utf-8''${encodeURIComponent(fileName)}`;
 				return new Response(本地Clash配置, { headers: responseHeaders });
 			} else if (订阅格式 == 'singbox') {
 				// ===== 方案A:本地生成 sing-box 配置,不依赖第三方 SUBAPI =====
 				// 复用 uriToClashProxy 解析节点,再转换为 sing-box outbounds + route
-				const 本地Singbox配置 = await 生成本地Singbox配置(过滤结果, env, fileName);
+				const 本地Singbox配置 = await 生成配置缓存('FMT:' + 缓存键 + ':singbox:' + fileName, () => 生成本地Singbox配置(过滤结果, env, fileName), 强制刷新);
 				if (!userAgent.includes('mozilla')) responseHeaders["Content-Disposition"] = `attachment; filename*=utf-8''${encodeURIComponent(fileName)}`;
 				return new Response(本地Singbox配置, { headers: responseHeaders });
 			} else if (订阅格式 == 'surge') {
 				// ===== 方案A:本地生成 Surge 配置,不依赖第三方 SUBAPI =====
 				// 复用 uriToClashProxy 解析节点,转换为 Surge [Proxy] + [Proxy Group] + [Rule]
 				// 注意:Surge 不支持 vless / ssr / hysteria(v1),这些协议的节点会被自动跳过
-				const 本地Surge配置 = await 生成本地Surge配置(过滤结果, env, fileName, request.url);
+				const 本地Surge配置 = await 生成配置缓存('FMT:' + 缓存键 + ':surge:' + fileName, () => 生成本地Surge配置(过滤结果, env, fileName, request.url), 强制刷新);
 				if (!userAgent.includes('mozilla')) responseHeaders["Content-Disposition"] = `attachment; filename*=utf-8''${encodeURIComponent(fileName)}`;
 				return new Response(本地Surge配置, { headers: responseHeaders });
 			} else if (订阅格式 == 'quanx') {
 				// ===== 方案A:本地生成 Quantumult X 配置,不依赖第三方 SUBAPI =====
 				// 复用 uriToClashProxy 解析节点,转换为 [server_local] + [policy] + [filter_local]
 				// 注意:QX 不支持 tuic/wireguard/socks5/anytls,这些协议节点会被自动跳过
-				const 本地Quanx配置 = await 生成本地Quanx配置(过滤结果, env, fileName);
+				const 本地Quanx配置 = await 生成配置缓存('FMT:' + 缓存键 + ':quanx:' + fileName, () => 生成本地Quanx配置(过滤结果, env, fileName), 强制刷新);
 				if (!userAgent.includes('mozilla')) responseHeaders["Content-Disposition"] = `attachment; filename*=utf-8''${encodeURIComponent(fileName)}`;
 				return new Response(本地Quanx配置, { headers: responseHeaders });
 			} else if (订阅格式 == 'loon') {
 				// ===== 方案A:本地生成 Loon 配置,不依赖第三方 SUBAPI =====
 				// 复用 uriToClashProxy 解析节点,转换为 [Proxy] + [Proxy Group] + [Rule]
 				// 注意:Loon 不支持 socks5/tuic/anytls,这些协议节点会被自动跳过
-				const 本地Loon配置 = await 生成本地Loon配置(过滤结果, env, fileName);
+				const 本地Loon配置 = await 生成配置缓存('FMT:' + 缓存键 + ':loon:' + fileName, () => 生成本地Loon配置(过滤结果, env, fileName), 强制刷新);
 				if (!userAgent.includes('mozilla')) responseHeaders["Content-Disposition"] = `attachment; filename*=utf-8''${encodeURIComponent(fileName)}`;
 				return new Response(本地Loon配置, { headers: responseHeaders });
 			}
@@ -471,14 +568,25 @@ async function nginx() {
 	return text;
 }
 
-async function sendMessage(type, ip, add_data = "", botToken = '', chatID = '') {
+async function sendMessage(type, ip, add_data = "", botToken = '', chatID = '', skipIpLookup = false) {
 	if (botToken !== '' && chatID !== '') {
 		let msg = "";
-		const response = await fetch(`https://ip-api.com/json/${encodeURIComponent(ip || '')}?lang=zh-CN`, { signal: AbortSignal.timeout(3000) });
-		if (response.status == 200) {
-			const ipInfo = await response.json();
-			msg = `${telegramEscape(type)}\nIP: ${telegramEscape(ip)}\n国家: ${telegramEscape(ipInfo.country)}\n<tg-spoiler>城市: ${telegramEscape(ipInfo.city)}\n组织: ${telegramEscape(ipInfo.org)}\nASN: ${telegramEscape(ipInfo.as)}\n${telegramEscape(add_data)}`;
+		// 通知改为后台异步(ctx.waitUntil)发送后,此处任何失败都不应影响主流程:
+		// ip-api 查询超时/失败时降级为不带归属地的消息,不再向上抛异常。
+		if (!skipIpLookup) {
+			try {
+				const response = await fetch(`https://ip-api.com/json/${encodeURIComponent(ip || '')}?lang=zh-CN`, { signal: AbortSignal.timeout(3000) });
+				if (response.status == 200) {
+					const ipInfo = await response.json();
+					msg = `${telegramEscape(type)}\nIP: ${telegramEscape(ip)}\n国家: ${telegramEscape(ipInfo.country)}\n<tg-spoiler>城市: ${telegramEscape(ipInfo.city)}\n组织: ${telegramEscape(ipInfo.org)}\nASN: ${telegramEscape(ipInfo.as)}\n${telegramEscape(add_data)}`;
+				} else {
+					msg = `${telegramEscape(type)}\nIP: ${telegramEscape(ip)}\n<tg-spoiler>${telegramEscape(add_data)}`;
+				}
+			} catch (e) {
+				msg = `${telegramEscape(type)}\nIP: ${telegramEscape(ip)}\n<tg-spoiler>${telegramEscape(add_data)}`;
+			}
 		} else {
+			// IPINFO=0:不查询第三方归属地,不向 ip-api.com 暴露访客 IP
 			msg = `${telegramEscape(type)}\nIP: ${telegramEscape(ip)}\n<tg-spoiler>${telegramEscape(add_data)}`;
 		}
 
@@ -2430,6 +2538,12 @@ function uriToClashProxy(uri) {
 					cipher: json.scy || 'auto',
 					udp: true,
 				};
+				// vmess cipher 白名单:mihomo 实测仅支持 auto/aes-128-gcm/chacha20-poly1305/none,
+				// 其余值(常见误配如 ss 的 chacha20-ietf-poly1305)会拒绝加载整个配置,整节点丢弃。
+				const VMESS_CIPHERS = new Set(['auto', 'aes-128-gcm', 'chacha20-poly1305', 'none']);
+				if (json.scy && !VMESS_CIPHERS.has(String(json.scy).toLowerCase())) return null;
+				// alterId 必须为非负整数(实测字符串/NaN 会让 mihomo 拒绝加载整个配置)
+				if (json.aid && !/^\d+$/.test(String(json.aid))) return null;
 				const net = String(json.net || 'tcp').toLowerCase();
 				if (net !== 'tcp') p.network = net;
 				if (net === 'ws') p['ws-opts'] = { path: json.path || '/', headers: json.host ? { Host: json.host } : undefined };
@@ -2480,6 +2594,9 @@ function uriToClashProxy(uri) {
 		let query = '';
 		if (qIdx !== -1) { query = hostPort.slice(qIdx + 1); hostPort = hostPort.slice(0, qIdx); }
 		const params = new URLSearchParams(query);
+		// 部分机场模板 URI 带尾部斜杠(如 hysteria2://pw@host:443/),
+		// 直接匹配会失败导致节点被误丢,去掉尾部斜杠再解析。
+		hostPort = hostPort.replace(/\/+$/, '');
 		let server = hostPort, port = '';
 		const hm = hostPort.match(/^\[(.+)\]:(\d+)$/) || hostPort.match(/^([^:]+):(\d+)$/);
 		if (hm) { server = hm[1]; port = hm[2]; }
@@ -2549,12 +2666,22 @@ function uriToClashProxy(uri) {
 				// cipher 白名单:mihomo 对不认识的 cipher 报 initialize error 并使整个配置加载失败
 				// (实测 salsa20/camellia-*/rc4/大写变体均被拒,2022-blake3 需 base64 密码解码为 16/32 字节 key)
 				const normCipher = String(cipher).toLowerCase().trim();
+				// cipher 白名单与 mihomo v1.19.x 实测支持列表一致(逐项用 mihomo -t 验证过);
+				// 注意:chacha20-poly1305 是 mihomo 明确不支持的名称(实测报 cipher not supported),
+				// 不能加入白名单,否则会让整个配置加载失败。
 				const SS_CIPHERS = new Set([
 					'aes-128-gcm', 'aes-192-gcm', 'aes-256-gcm',
-					'chacha20-ietf-poly1305', 'xchacha20-ietf-poly1305',
+					'aes-128-ccm', 'aes-192-ccm', 'aes-256-ccm',
+					'aes-128-gcm-siv', 'aes-256-gcm-siv',
 					'aes-128-cfb', 'aes-192-cfb', 'aes-256-cfb',
-					'rc4-md5', 'chacha20-ietf', 'chacha20', 'none',
 					'aes-128-ctr', 'aes-192-ctr', 'aes-256-ctr',
+					'chacha20-ietf-poly1305', 'xchacha20-ietf-poly1305',
+					'chacha8-ietf-poly1305', 'xchacha8-ietf-poly1305',
+					'chacha20-ietf', 'chacha20', 'xchacha20',
+					'lea-128-gcm', 'lea-192-gcm', 'lea-256-gcm',
+					'rabbit128-poly1305', 'aegis-128l', 'aegis-256',
+					'aez-384', 'deoxys-ii-256-128',
+					'rc4-md5', 'none',
 					'2022-blake3-aes-128-gcm', '2022-blake3-aes-256-gcm', '2022-blake3-chacha20-poly1305',
 				]);
 				if (!SS_CIPHERS.has(normCipher)) return null;
@@ -2576,6 +2703,12 @@ function uriToClashProxy(uri) {
 							const eq = kv.indexOf('=');
 							if (eq > 0) { const k = kv.slice(0, eq); const v = kv.slice(eq + 1); if (k === 'obfs') opts.mode = v; else if (k === 'obfs-host') opts.host = v; }
 						}
+						// mihomo 的 obfs 仅接受 http/tls 两种模式,缺失时按 simple-obfs 惯例默认 http;
+						// 非法模式(on/off/yes/自定义等)会让 mihomo 报 "obfs mode error" 并拒绝加载整个配置,
+						// 这类节点整条丢弃(宁缺毋滥,不拖垮整份配置)。
+						const 模式 = String(opts.mode || 'http').toLowerCase();
+						if (模式 !== 'http' && 模式 !== 'tls') return null;
+						opts.mode = 模式;
 						p['plugin-opts'] = opts;
 					} else if (parts[0].includes('v2ray')) {
 						p.plugin = 'v2ray-plugin';
@@ -2585,6 +2718,12 @@ function uriToClashProxy(uri) {
 							if (eq > 0) opts[kv.slice(0, eq)] = kv.slice(eq + 1);
 							else opts[kv.trim()] = true;
 						}
+						// mihomo 的 v2ray-plugin 仅支持 mode=websocket(官方注释 no QUIC now),
+						// 缺失时默认 websocket;非法模式(quic/ws 等)会让 mihomo 报错并拒绝加载整个配置,
+						// 这类节点整条丢弃。
+						const 模式 = String(opts.mode || 'websocket').toLowerCase();
+						if (模式 !== 'websocket') return null;
+						opts.mode = 模式;
 						p['plugin-opts'] = opts;
 					}
 				}
@@ -2597,8 +2736,16 @@ function uriToClashProxy(uri) {
 				if (params.get('insecure') === '1') p['skip-cert-verify'] = true;
 				if (params.get('up')) p.up = params.get('up');
 				if (params.get('down')) p.down = params.get('down');
-				if (params.get('obfs')) p.obfs = params.get('obfs');
-				if (params.get('obfs-password')) p['obfs-password'] = params.get('obfs-password');
+				// mihomo 的 hysteria2 obfs 仅支持 salamander 且必须带密码;
+				// none/自定义值或缺密码实测都会报错并拒绝加载整个配置,整节点丢弃。
+				const hy2obfs = params.get('obfs');
+				if (hy2obfs) {
+					if (String(hy2obfs).toLowerCase() !== 'salamander') return null;
+					const hy2obfsPw = params.get('obfs-password');
+					if (!hy2obfsPw) return null;
+					p.obfs = 'salamander';
+					p['obfs-password'] = hy2obfsPw;
+				}
 				return p;
 			}
 			case 'hysteria': {
@@ -2606,9 +2753,13 @@ function uriToClashProxy(uri) {
 				if (params.get('auth')) p['auth_str'] = params.get('auth');
 				if (params.get('peer')) p.sni = params.get('peer');
 				if (params.get('insecure') === '1') p['skip-cert-verify'] = true;
-				// mihomo 的 hysteria v1 必填 up/down,缺失会报 has unset fields 并使整个配置失败,给默认值
-				p.up = params.get('upmbps') || '100';
-				p.down = params.get('downmbps') || '100';
+				// mihomo 的 hysteria v1 必填正整数 up/down,缺失给默认值;
+				// 非数字/小数/0 实测会报错并拒绝加载整个配置,整节点丢弃。
+				const hy1up = params.get('upmbps'), hy1down = params.get('downmbps');
+				if (hy1up && !/^[1-9]\d*$/.test(hy1up)) return null;
+				if (hy1down && !/^[1-9]\d*$/.test(hy1down)) return null;
+				p.up = hy1up || '100';
+				p.down = hy1down || '100';
 				return p;
 			}
 			case 'tuic': {
@@ -2633,17 +2784,24 @@ function uriToClashProxy(uri) {
 				};
 				const priv = normWgKey(params.get('pvtkey'));
 				if (!priv) return null; // 缺失/非法 private-key:丢弃节点
-				// mihomo 会为 ip 追加 /32 后解析:非法的 ip 报 ip address parse error 并使整个配置失败
+				// mihomo 的 wireguard ip 字段仅接受纯 IPv4:实测 IPv6 / CIDR 后缀 / 前导零 / 越界
+				// (如 10.0.0.2/32、999.999.999.999、01.02.03.04、2001:db8::1)都会报错并拒绝加载整个配置。
 				const rawIp = String(params.get('ip') || '10.0.0.2').trim();
-				const isIpCidr = /^(\d{1,3}\.){3}\d{1,3}(\/\d{1,2})?$/.test(rawIp) || /^[0-9a-fA-F:]+(\/\d{1,3})?$/.test(rawIp);
-				if (!isIpCidr) return null; // 非法 ip:丢弃节点
+				const ipOk = /^(0|[1-9]\d{0,2})(\.(0|[1-9]\d{0,2})){3}$/.test(rawIp)
+					&& rawIp.split('.').every(o => Number(o) <= 255);
+				if (!ipOk) return null; // 非法 ip:丢弃节点
 				const p = { ...base, type: 'wireguard', ip: rawIp };
 				p['private-key'] = priv;
 				const pub = normWgKey(params.get('pubkey'));
 				if (pub) p['public-key'] = pub;
 				const psk = normWgKey(params.get('presharedkey'));
 				if (psk) p['pre-shared-key'] = psk;
-				if (params.get('reserved')) p.reserved = String(params.get('reserved')).split(',').map(Number);
+				// mihomo 的 reserved 必须恰好 3 字节且每字节 0-255(实测 2/4 字节会拒绝加载整个配置)
+				if (params.get('reserved')) {
+					const reserved = String(params.get('reserved')).split(',').map(Number);
+					if (reserved.length !== 3 || reserved.some(n => !Number.isInteger(n) || n < 0 || n > 255)) return null;
+					p.reserved = reserved;
+				}
 				// mtu 必须为正整数,非法值 mihomo 报 cannot parse 'mtu' as int 并使整个配置失败
 				const mtu = Number(params.get('mtu'));
 				if (params.get('mtu') && Number.isInteger(mtu) && mtu > 0) p.mtu = mtu;
@@ -2656,9 +2814,14 @@ function uriToClashProxy(uri) {
 				if (params.get('sni') || params.get('servername')) p.sni = params.get('sni') || params.get('servername');
 				if (params.get('allowInsecure') === '1') p['skip-cert-verify'] = true;
 				if (params.get('udp') === '1') p.udp = true;
-				if (params.get('idle-session-check-interval')) p['idle-session-check-interval'] = Number(params.get('idle-session-check-interval'));
-				if (params.get('idle-session-timeout')) p['idle-session-timeout'] = Number(params.get('idle-session-timeout'));
-				if (params.get('min-idle-session')) p['min-idle-session'] = Number(params.get('min-idle-session'));
+				// mihomo 的 anytls 数字字段必须是正整数(实测字符串/NaN 会拒绝加载整个配置)
+				for (const key of ['idle-session-check-interval', 'idle-session-timeout', 'min-idle-session']) {
+					const v = params.get(key);
+					if (v) {
+						if (!/^[1-9]\d*$/.test(v)) return null;
+						p[key] = Number(v);
+					}
+				}
 				return p;
 			}
 			case 'socks':
@@ -3483,7 +3646,7 @@ function clashToLoonProxy(p) {
 			peer.push('allowed-ips="0.0.0.0/0"');
 			peer.push('endpoint=' + server + ':' + port);
 			args.push('peers=[{' + peer.join(',') + '}]');
-			args.push('keeyalive=45');
+			args.push('keepalive=45');
 			return displayName + ' = ' + args.join(',');
 		}
 		case 'http': {
@@ -3516,8 +3679,9 @@ async function 生成本地Loon配置(节点文本, env, fileName = DEFAULT_FILE
 	const proxies = [];
 	const names = [];
 	for (const line of lines) {
-		const p = uriToClashProxy(line);
-		if (!p) continue;
+		let p;
+		try { p = uriToClashProxy(line); } catch (e) { p = null; } // 单节点解析失败只跳过该节点
+		if (!p || !校验节点(p)) continue; // 协议级校验:不合格节点宁缺毋滥(与其他格式生成器一致)
 		const pr = clashToLoonProxy(p);
 		if (!pr) continue;
 		proxies.push(pr);
@@ -3633,8 +3797,234 @@ function 节点去重身份(line) {
 	}
 }
 
+// ==================== 本地 GeoIP:中国大陆 IP 段匹配(零第三方 IP 查询接口) ====================
+// 从 GitHub 下载中国 IP 段(CIDR 列表,17mon/china_ip_list)后完全本地匹配:
+//   - 数据经 KV 缓存(7 天) + 实例内存缓存(1 小时),不向任何 IP 归属查询网站发请求;
+//   - 服务器为 IP 字面量的节点:直接二分匹配中国 IP 段,比名称关键词更准确
+//     (机场常给大陆节点起境外名,或给境外节点起大陆名,名称不可靠);
+//   - 服务器为域名(Worker 内无法做 DNS 解析)或未加载到 IP 数据时:回退到名称关键词判断。
+
+// 从节点行中提取服务器地址(host,不含端口);vmess/ssr 需要解码 base64,其余取 @ 后主机部分。
+function 节点服务器地址(line) {
+	try {
+		const s = String(line || '').trim();
+		if (s.startsWith('vmess://')) {
+			const json = JSON.parse(base64Decode(s.slice(8)));
+			if (json && json.add) return String(json.add);
+			return '';
+		}
+		if (s.startsWith('ssr://')) {
+			const decoded = base64Decode(s.slice(6));
+			const core = decoded.split('/?')[0].split(':');
+			return core[0] || '';
+		}
+		const hashIdx = s.indexOf('#');
+		let body = hashIdx === -1 ? s : s.slice(0, hashIdx);
+		const schemeIdx = body.indexOf('://');
+		if (schemeIdx === -1) return '';
+		body = body.slice(schemeIdx + 3);
+		const atIdx = body.lastIndexOf('@');
+		if (atIdx !== -1) body = body.slice(atIdx + 1);
+		const m = body.match(/^(\[[0-9a-fA-F:]+\]|[^:/?#]+)/);
+		if (!m) return '';
+		return m[1].replace(/^\[|\]$/g, '');
+	} catch (e) {
+		return '';
+	}
+}
+
+// 判断字符串是否为 IP 字面量(IPv4 或 IPv6),域名返回 false
+function 是IP字面量(host) {
+	if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) {
+		return host.split('.').every(o => Number(o) <= 255);
+	}
+	if (host.includes(':')) return /^[0-9a-fA-F:]+$/.test(host);
+	return false;
+}
+
+function 解析IPv4(ip) {
+	const parts = ip.split('.');
+	if (parts.length !== 4) return null;
+	let num = 0;
+	for (const p of parts) {
+		if (!/^\d{1,3}$/.test(p)) return null;
+		const o = Number(p);
+		if (o > 255) return null;
+		num = (num << 8) | o;
+	}
+	return num >>> 0;
+}
+
+// 简化 IPv6 解析:标准 8 组 + :: 压缩,不支持内嵌 IPv4(中国 IP 段列表不包含)
+function 解析IPv6(ip) {
+	const parts = String(ip).split('::');
+	if (parts.length > 2) return null;
+	const head = parts[0] ? parts[0].split(':') : [];
+	const tail = parts.length === 2 && parts[1] ? parts[1].split(':') : [];
+	const groups = [];
+	for (const g of head) {
+		const v = parseInt(g, 16);
+		if (isNaN(v) || v > 0xffff) return null;
+		groups.push(v);
+	}
+	if (parts.length === 2) {
+		const missing = 8 - head.length - tail.length;
+		if (missing < 1) return null;
+		for (let i = 0; i < missing; i++) groups.push(0);
+	}
+	for (const g of tail) {
+		const v = parseInt(g, 16);
+		if (isNaN(v) || v > 0xffff) return null;
+		groups.push(v);
+	}
+	if (groups.length !== 8) return null;
+	let num = 0n;
+	for (const g of groups) num = (num << 16n) | BigInt(g);
+	return num;
+}
+
+// 单个 CIDR -> { type:'v4'|'v6', start, end }(含边界),非法返回 null
+function CIDR转区间(cidr) {
+	const m = String(cidr).match(/^([0-9a-fA-F:.]+)\/(\d{1,3})$/);
+	if (!m) return null;
+	const ip = m[1];
+	const bits = Number(m[2]);
+	if (ip.includes(':')) {
+		const num = 解析IPv6(ip);
+		if (num === null || bits > 128) return null;
+		const hostBits = 128 - bits;
+		const start = hostBits === 128 ? 0n : (num >> BigInt(hostBits)) << BigInt(hostBits);
+		const end = hostBits === 128 ? 0xffffffffffffffffffffffffffffffffn : start + ((1n << BigInt(hostBits)) - 1n);
+		return { type: 'v6', start, end };
+	}
+	const num = 解析IPv4(ip);
+	if (num === null || bits > 32) return null;
+	const hostBits = 32 - bits;
+	const start = hostBits === 32 ? 0 : (num >>> hostBits) << hostBits;
+	const end = hostBits === 32 ? 0xffffffff : start + ((1 << hostBits) - 1);
+	return { type: 'v4', start: start >>> 0, end: end >>> 0 };
+}
+
+// 解析 CIDR 文本列表 -> { v4: 合并排序区间[], v6: 合并排序区间[] },无有效行返回 null
+function 解析中国IP文本(text) {
+	const v4 = [];
+	const v6 = [];
+	for (const line of String(text || '').split(/\r?\n/)) {
+		const cidr = line.trim();
+		if (!cidr || cidr.startsWith('#') || cidr.startsWith(';')) continue;
+		const r = CIDR转区间(cidr);
+		if (!r) continue;
+		if (r.type === 'v4') v4.push([r.start, r.end]);
+		else v6.push([r.start, r.end]);
+	}
+	if (v4.length === 0 && v6.length === 0) return null;
+	return { v4: 合并区间(v4), v6: 合并区间(v6), 行数: v4.length + v6.length };
+}
+
+// 排序 + 合并相邻/重叠区间,产出互不重叠的升序区间数组,供二分查找
+function 合并区间(list) {
+	if (list.length < 2) return list;
+	list.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+	const out = [list[0]];
+	for (let i = 1; i < list.length; i++) {
+		const last = out[out.length - 1];
+		const cur = list[i];
+		const step = typeof last[1] === 'bigint' ? 1n : 1;
+		if (cur[0] <= last[1] + step) {
+			if (cur[1] > last[1]) last[1] = cur[1];
+		} else {
+			out.push(cur);
+		}
+	}
+	return out;
+}
+
+// 在有序区间数组上二分查找
+function 区间二分查找(区间, num) {
+	let lo = 0, hi = 区间.length - 1;
+	while (lo <= hi) {
+		const mid = (lo + hi) >> 1;
+		const r = 区间[mid];
+		if (num < r[0]) hi = mid - 1;
+		else if (num > r[1]) lo = mid + 1;
+		else return true;
+	}
+	return false;
+}
+
+// 判断 IP 是否命中中国 IP 段(本地匹配,不请求任何外部接口)
+function 中国IP匹配(数据, ip) {
+	if (!数据 || !ip) return false;
+	if (ip.includes(':')) {
+		if (!数据.v6 || 数据.v6.length === 0) return false;
+		const num = 解析IPv6(ip);
+		return num !== null && 区间二分查找(数据.v6, num);
+	}
+	if (!数据.v4 || 数据.v4.length === 0) return false;
+	const num = 解析IPv4(ip);
+	return num !== null && 区间二分查找(数据.v4, num);
+}
+
+// ===== 中国 IP 段数据获取(KV 7 天缓存 + 实例内存 1 小时缓存 + 失败退避) =====
+// 与 CLASH_RULES 同一套缓存思路:平时零网络请求,仅在 KV 过期且未在退避期内才去 GitHub 下载。
+const 中国IP源 = [
+	{ url: 'https://raw.githubusercontent.com/17mon/china_ip_list/master/china_ip_list.txt', name: '17mon-raw' },
+	{ url: 'https://cdn.jsdelivr.net/gh/17mon/china_ip_list@master/china_ip_list.txt', name: '17mon-jsdelivr' },
+	{ url: 'https://fastly.jsdelivr.net/gh/17mon/china_ip_list@master/china_ip_list.txt', name: '17mon-fastly' },
+];
+const 中国IP内存 = { 数据: null, 版本: '', at: 0 }; // at=0 表示从未成功加载
+const 中国IP缓存有效期 = 7 * 24 * 3600 * 1000; // 7 天
+const 中国IP重试退避 = 3600 * 1000; // 失败后 1 小时内不重复下载
+
+async function 获取中国IP数据(env) {
+	const now = Date.now();
+	// 1) 实例内存缓存:避免每请求重新读 KV / 重新解析数万条 CIDR
+	if (中国IP内存.数据 && now - 中国IP内存.at < 3600 * 1000) return 中国IP内存;
+	// 2) KV 缓存
+	if (env && env.KV) {
+		try {
+			const raw = await env.KV.get('CHINA_IP.txt');
+			const at = Number(await env.KV.get('CHINA_IP_AT') || 0);
+			if (raw && now - at < 中国IP缓存有效期) {
+				const d = 解析中国IP文本(raw);
+				if (d) { 中国IP内存.数据 = d; 中国IP内存.版本 = String(at); 中国IP内存.at = now; return 中国IP内存; }
+			}
+		} catch (e) { /* KV 异常则走下载 */ }
+	}
+	// 3) 失败退避:1 小时内不重复尝试下载(有 KV 时以 KV 的 CHINA_IP_TRY 为准)
+	if (now - 中国IP内存.at < 中国IP重试退避) return 中国IP内存.数据 ? 中国IP内存 : null;
+	if (env && env.KV) {
+		try {
+			const lastTry = Number(await env.KV.get('CHINA_IP_TRY') || 0);
+			if (now - lastTry < 中国IP重试退避) return 中国IP内存.数据 ? 中国IP内存 : null;
+			await env.KV.put('CHINA_IP_TRY', String(now), { expirationTtl: 3600 });
+		} catch (e) { /* 忽略 */ }
+	}
+	// 4) 按顺序尝试各源下载
+	for (const 源 of 中国IP源) {
+		try {
+			const res = await fetch(源.url, { signal: AbortSignal.timeout(15000) });
+			if (!res.ok) continue;
+			const text = await res.text();
+			const d = 解析中国IP文本(text);
+			if (d) {
+				中国IP内存.数据 = d; 中国IP内存.版本 = String(now); 中国IP内存.at = now;
+				if (env && env.KV) {
+					try {
+						await env.KV.put('CHINA_IP.txt', text, { expirationTtl: 7 * 24 * 3600 });
+						await env.KV.put('CHINA_IP_AT', String(now), { expirationTtl: 7 * 24 * 3600 });
+					} catch (e) { /* 忽略 */ }
+				}
+				return 中国IP内存;
+			}
+		} catch (e) { /* 尝试下一个源 */ }
+	}
+	return 中国IP内存.数据 ? 中国IP内存 : null;
+}
+
 // ==================== 剔除中国大陆节点 ====================
-// 简单策略:节点名称命中「大陆关键词」即剔除,不做境外优化标记等额外判断。
+// 优先本地 GeoIP:服务器为 IP 字面量时按中国 IP 段精确匹配(不请求第三方 IP 查询接口);
+// 服务器为域名(Worker 内无法 DNS 解析)或未加载到 IP 数据时,回退到名称关键词判断:
 //   1. 关键词包含:省份/直辖市/重点城市/中国/大陆/内地/国内/境内 等地域词,以及
 //      大陆运营商词(移动/联通/电信/天翼/铁通)。
 //   2. 故意不包含 香港/澳门/台湾,因此这些地区节点不会误删。
@@ -3672,11 +4062,19 @@ function 解析节点名(line) {
 
 // 剔除「大陆节点」:名称命中「大陆关键词」的节点直接剔除,其余一律保留(宁缺毋滥)。
 // 特例:名称含「香港/澳门/台湾」的节点(如「中国香港-01」「中国台湾」)不影响跨境使用,一律保留。
-function 剔除大陆节点(text) {
+function 剔除大陆节点(text, 中国IP数据 = null) {
 	const src = String(text || '');
 	return src.split('\n').filter(line => {
 		const s = line.trim();
 		if (!s) return true; // 保留空行
+		// 本地 GeoIP:服务器为 IP 字面量时以 IP 归属为准(名称不可靠,机场常乱起名)
+		if (中国IP数据) {
+			const host = 节点服务器地址(s);
+			if (host && 是IP字面量(host)) {
+				return !中国IP匹配(中国IP数据, host); // 命中中国 IP 段即剔除
+			}
+		}
+		// 域名节点 / 未加载到 IP 数据:回退到名称关键词判断
 		const 名 = 解析节点名(s);
 		if (!名) return true; // 取不到名称(注释等)一律保留
 		if (/香港|澳门|台湾/.test(名)) return true; // 港澳台节点保留(如「中国香港」)
@@ -3733,14 +4131,17 @@ async function KV(request, env, txt = 'ADD.txt', { subscriptionToken, fileName }
 				if (url.searchParams.get('save') === 'protocol') {
 					const clean = String(content).split(/[,;\n]+/).map(x => x.trim().toLowerCase()).filter(Boolean).join(',');
 					await env.KV.put('PROTOCOL.txt', clean);
+					热点缓存删('PROTOCOL.txt'); // 同实例内立即生效,无需等 30s 热点缓存过期
 					return new Response("协议过滤设置已保存");
 				}
 				// 剔除大陆节点开关: 使用 ?save=nocn 区分,保存到 NOCN.txt
 				if (url.searchParams.get('save') === 'nocn') {
 					await env.KV.put('NOCN.txt', String(content).trim());
+					热点缓存删('NOCN.txt');
 					return new Response("剔除大陆节点设置已保存");
 				}
 				await env.KV.put(txt, content);
+				热点缓存删(txt);
 				return new Response("保存成功");
 			} catch (error) {
 				console.error('保存KV时发生错误:', error);
@@ -4029,10 +4430,14 @@ async function KV(request, env, txt = 'ADD.txt', { subscriptionToken, fileName }
 							if (status) { status.textContent = msg; status.style.color = color || '#666'; }
 						};
 						setStatus('保存中...');
-						fetch(window.location.pathname + '?save=protocol', {
+						// 保留当前 URL 的 token 等参数,避免经 /?token= 打开的页在保存时丢掉鉴权参数
+						const saveUrl = new URL(window.location.href);
+						saveUrl.search = '';
+						saveUrl.searchParams.set('save', 'protocol');
+						fetch(saveUrl.toString(), {
 							method: 'POST',
 							body: collectProtocols(),
-							headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+							headers: { 'Content-Type': 'text/plain;charset=UTF-8', 'Accept': 'text/html' },
 							cache: 'no-cache'
 						}).then(res => {
 							if (!res.ok) throw new Error('HTTP error! status: ' + res.status);
@@ -4064,7 +4469,7 @@ async function KV(request, env, txt = 'ADD.txt', { subscriptionToken, fileName }
 					fetch(saveUrl.toString(), {
 							method: 'POST',
 							body: cb && cb.checked ? '1' : '0',
-							headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+							headers: { 'Content-Type': 'text/plain;charset=UTF-8', 'Accept': 'text/html' },
 							cache: 'no-cache'
 						}).then(res => {
 							if (!res.ok) throw new Error('HTTP error! status: ' + res.status);
@@ -4148,7 +4553,8 @@ async function KV(request, env, txt = 'ADD.txt', { subscriptionToken, fileName }
 										method: 'POST',
 										body: newContent,
 										headers: {
-											'Content-Type': 'text/plain;charset=UTF-8'
+											'Content-Type': 'text/plain;charset=UTF-8',
+											'Accept': 'text/html'
 										},
 										cache: 'no-cache'
 									})

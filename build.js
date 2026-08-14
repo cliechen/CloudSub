@@ -48,7 +48,14 @@ for (const f of FILES) {
 }
 
 if (checkOnly) {
-	console.log(`[build] --check: 源文件共 ${out.length} 字节`);
+	// 真正校验:拼接结果必须与已生成的 _worker.js 完全一致,
+	// 否则说明 src/ 被改动后未重新 build,部署产物会落后于源码。
+	const current = fs.existsSync(OUT) ? fs.readFileSync(OUT, 'utf8') : null;
+	if (current !== out) {
+		console.error('[build] --check: src/ 与 _worker.js 不一致,请先运行 node build.js 重新生成');
+		process.exit(1);
+	}
+	console.log(`[build] --check: 通过,${out.length} 字节,src/ 与 _worker.js 一致`);
 	process.exit(0);
 }
 

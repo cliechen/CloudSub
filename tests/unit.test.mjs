@@ -31,7 +31,7 @@ const tmpWorker = path.join('/tmp', `_worker_unit_${process.pid}.cjs`);
 fs.writeFileSync(
 	tmpWorker,
 	workerSrc +
-		'\nmodule.exports.__test = { hashText, 本地解析订阅内容, 节点去重, 节点协议, 过滤协议节点, 解析节点名, 剔除大陆节点, parseYamlValue, base64Decode, proxyURL, 生成本地Clash配置, 生成本地Singbox配置, getSUB };\n'
+		'\nmodule.exports.__test = { hashText, 本地解析订阅内容, 节点去重, 节点协议, 过滤协议节点, 解析节点名, 剔除大陆节点, parseYamlValue, base64Decode, proxyURL, 生成本地Clash配置, 生成本地Singbox配置, 生成本地Surge配置, 生成本地Quanx配置, 生成本地Loon配置, singboxJSONtoURIs, 迁移地址列表, KV, getSUB, 解析中国IP文本, 中国IP匹配, 节点服务器地址, 清空实例缓存: () => { 内存缓存.clear(); 热点缓存.clear(); SWR调度记录.clear(); 迁移已执行 = false; } };\n'
 );
 const mod = await import(pathToFileURL(tmpWorker).href);
 const {
@@ -47,7 +47,17 @@ const {
 	proxyURL,
 	生成本地Clash配置,
 	生成本地Singbox配置,
+	生成本地Surge配置,
+	生成本地Quanx配置,
+	生成本地Loon配置,
+	singboxJSONtoURIs,
+	迁移地址列表,
+	KV,
 	getSUB,
+	解析中国IP文本,
+	中国IP匹配,
+	节点服务器地址,
+	清空实例缓存,
 } = mod.default.__test;
 const worker = mod.default;
 
@@ -58,6 +68,9 @@ const 默认限制 = { sources: 50, perSource: 10 * 1024 * 1024, total: 40 * 102
 let passed = 0;
 const results = [];
 async function t(name, fn) {
+	// 每次测试前清空实例级内存缓存(内存热缓存/热点缓存/SWR 调度/迁移标记),
+	// 避免同一 Worker 模块实例下跨测试的状态污染(不同测试使用不同的 KV store)。
+	清空实例缓存();
 	try {
 		await fn();
 		passed++;
@@ -492,6 +505,375 @@ await t('Clash 订阅 + 协议过滤: 只保留勾选协议节点', async () => 
 	} finally {
 		globalThis.fetch = originalFetch;
 	}
+});
+
+await t('生成本地Surge配置: 输出各段落, 跳过 vless', async () => {
+	const nodes = [
+		'vless://00000000-0000-0000-0000-000000000000@1.2.3.4:443?type=tcp#vl',
+		'trojan://pw@8.8.8.8:443#tj',
+		'ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpwYXNz@7.7.7.7:8443#ss',
+	].join('\n');
+	const cfg = await 生成本地Surge配置(nodes, {}, 'UnitTest', 'https://worker.example/sub?token=x');
+	assert.ok(cfg.includes('[Proxy]') && cfg.includes('[Proxy Group]') && cfg.includes('[Rule]'), '应包含 Surge 各段落');
+	assert.ok(cfg.includes('8.8.8.8') && cfg.includes('7.7.7.7'), '应含 trojan/ss 节点');
+	assert.ok(!cfg.includes('1.2.3.4'), 'vless 应被 Surge 跳过');
+});
+
+await t('生成本地Quanx配置: 输出各段落, 跳过 tuic', async () => {
+	const nodes = [
+		'ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpwYXNz@7.7.7.7:8443#ss',
+		'tuic://00000000-0000-0000-0000-000000000000:pw@8.8.8.8:443?sni=x.com#tuic',
+	].join('\n');
+	const cfg = await 生成本地Quanx配置(nodes, {}, 'UnitTest');
+	assert.ok(cfg.includes('[server_local]') && cfg.includes('[policy]') && cfg.includes('[filter_local]'), '应包含 QX 各段落');
+	assert.ok(cfg.includes('shadowsocks='), '应含 ss 节点');
+	assert.ok(!cfg.includes('tuic='), 'tuic 应被 QX 跳过');
+});
+
+await t('生成本地Loon配置: 输出各段落, 跳过 socks5', async () => {
+	const nodes = [
+		'ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpwYXNz@7.7.7.7:8443#ss',
+		'socks5://u:p@8.8.8.8:1080#socks',
+	].join('\n');
+	const cfg = await 生成本地Loon配置(nodes, {}, 'UnitTest');
+	assert.ok(cfg.includes('[Proxy]') && cfg.includes('[Proxy Group]') && cfg.includes('[Rule]'), '应包含 Loon 各段落');
+	assert.ok(cfg.includes('Shadowsocks'), '应含 ss 节点');
+	assert.ok(!cfg.includes('socks5'), 'socks5 应被 Loon 跳过');
+});
+
+await t('生成本地Loon配置: 残缺节点同样被校验丢弃(与其他格式生成器一致)', async () => {
+	const b64 = s => Buffer.from(s, 'utf8').toString('base64');
+	// vmess 无 uuid: uriToClashProxy 能解析但 校验节点 会拦截(Clash 生成器已丢弃,Loon 此前泄漏)
+	const 无uuid = 'vmess://' + b64(JSON.stringify({ v: '2', ps: '无uuid', add: '1.2.3.4', port: '443', id: '', scy: 'auto' }));
+	const good = 'ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpwYXNz@7.7.7.7:8443#good';
+	const cfg = await 生成本地Loon配置([无uuid, good].join('\n'), {}, 'UnitTest');
+	assert.ok(!cfg.includes('无uuid'), '无 uuid 的 vmess 节点应被丢弃(避免输出不可用节点)');
+	assert.ok(cfg.includes('good'), '合法节点不受影响');
+});
+
+await t('生成本地Loon配置: wireguard 输出 keepalive 字段拼写正确', async () => {
+	const key = Buffer.from('a'.repeat(32)).toString('base64').replace(/=+$/, '');
+	const wg = 'wireguard://1.2.3.4:51820?pvtkey=' + key + '&pubkey=' + key + '&ip=10.0.0.2#wg1';
+	const cfg = await 生成本地Loon配置(wg, {}, 'UnitTest');
+	assert.ok(cfg.includes('keepalive=45'), '应输出 keepalive(此前笔误为 keeyalive)');
+	assert.ok(!cfg.includes('keeyalive'), '不应出现 keeyalive 笔误拼写');
+});
+
+await t('singboxJSONtoURIs: 解析 sing-box outbounds', async () => {
+	const json = JSON.stringify({ outbounds: [
+		{ type: 'vless', tag: 'v1', server: '1.2.3.4', server_port: 443, uuid: '00000000-0000-0000-0000-000000000000' },
+		{ type: 'direct', tag: 'direct' }, // 非代理类型应被忽略
+	] });
+	const uris = singboxJSONtoURIs(json);
+	assert.ok(uris.some(u => u.startsWith('vless://')), '应解析出 vless URI');
+	assert.ok(!uris.some(u => u.includes('direct')), 'direct 等非代理 outbound 不应转换');
+});
+
+await t('本地解析: v2ray/Xray JSON 输入', async () => {
+	const v2 = JSON.stringify({ outbounds: [
+		{ protocol: 'vmess', tag: 'x', settings: { vnext: [ { address: '1.2.3.4', port: 443, users: [ { id: '00000000-0000-0000-0000-000000000000', alterId: 0, security: 'auto' } ] } ] },
+			streamSettings: { network: 'ws', security: 'tls', wsSettings: { path: '/p', headers: { Host: 'h.example' } } } },
+	] });
+	const parsed = 本地解析订阅内容(v2);
+	assert.ok(parsed && parsed.type === 'uris', '应识别 v2ray JSON');
+	assert.ok(String(parsed.text).includes('vmess://'), '应含 vmess URI');
+});
+
+await t('本地解析: SS JSON 列表', async () => {
+	const ss = JSON.stringify({ servers: [ { server: '1.2.3.4', server_port: 8388, method: 'aes-128-gcm', password: 'p' } ] });
+	const parsed = 本地解析订阅内容(ss);
+	assert.ok(parsed && parsed.type === 'uris', '应识别 SS JSON');
+	assert.ok(String(parsed.text).includes('ss://'), '应含 ss URI');
+});
+
+await t('本地解析: Surge profile 输入', async () => {
+	const surge = '[Proxy]\nproxy-a = ss, 1.2.3.4, 8388, encrypt-method=aes-128-gcm, password=pass\n';
+	const parsed = 本地解析订阅内容(surge);
+	assert.ok(parsed && parsed.type === 'uris', '应识别 Surge profile');
+	assert.ok(String(parsed.text).includes('ss://'), '应含 ss URI');
+});
+
+await t('本地解析: Quantumult X 输入', async () => {
+	const qx = '[server_local]\nshadowsocks=1.2.3.4:8388, method=aes-128-gcm, password=pass, tag=qx1\n';
+	const parsed = 本地解析订阅内容(qx);
+	assert.ok(parsed && parsed.type === 'uris', '应识别 QX 配置');
+	assert.ok(String(parsed.text).includes('ss://'), '应含 ss URI');
+});
+
+await t('本地解析: base64 包裹 Clash YAML(递归识别)', async () => {
+	const yaml = 'proxies:\n  - name: "t"\n    type: ss\n    server: 1.2.3.4\n    port: 8388\n    cipher: aes-128-gcm\n    password: p\n';
+	const b64 = Buffer.from(yaml, 'utf8').toString('base64');
+	const parsed = 本地解析订阅内容(b64);
+	assert.ok(parsed && parsed.type === 'uris', '应递归解码并识别 base64 包裹的 YAML');
+	assert.ok(String(parsed.text).includes('ss://'), '应含 ss URI');
+});
+
+await t('本地解析: 无法识别的内容返回 null', async () => {
+	assert.equal(本地解析订阅内容('这不是订阅源内容'), null);
+});
+
+await t('管理页 KV(): GET 渲染订阅地址, POST 保存内容/协议', async () => {
+	const store = new Map();
+	const kv = { async get(k){ return store.get(k)||null; }, async put(k,v){ store.set(k,String(v)); }, async delete(k){ store.delete(k); } };
+	const env = { KV: kv };
+	// GET: 渲染页面并包含订阅 token
+	const req = new Request('https://worker.example/auto?token=admin', { headers: { 'User-Agent': 'Mozilla/5.0 test' } });
+	const res = await KV(req, env, 'LINK.txt', { subscriptionToken: '550e8400-e29b-41d4-a716-446655440000', fileName: 'CloudSub' });
+	assert.equal(res.status, 200);
+	const html = await res.text();
+	assert.ok(html.includes('550e8400-e29b-41d4-a716-446655440000'), '页面应包含订阅 token');
+	// POST: 保存订阅内容
+	const post = new Request('https://worker.example/auto', { method: 'POST', body: 'vless://u@1.2.3.4:443#x\n' });
+	const res2 = await KV(post, env, 'LINK.txt', {});
+	assert.equal(res2.status, 200);
+	assert.ok(store.get('LINK.txt').includes('vless://'), '内容应写入 KV');
+	// POST: 保存协议过滤
+	const postP = new Request('https://worker.example/auto?save=protocol', { method: 'POST', body: 'vmess,vless' });
+	await KV(postP, env, 'LINK.txt', {});
+	assert.equal(store.get('PROTOCOL.txt'), 'vmess,vless', '协议配置应写入 PROTOCOL.txt');
+});
+
+await t('迁移地址列表: 旧键 /LINK.txt 迁移到 LINK.txt 且只执行一次', async () => {
+	const store = new Map([['/LINK.txt', 'old data']]);
+	const kv = { async get(k){ return store.get(k)||null; }, async put(k,v){ store.set(k,String(v)); }, async delete(k){ store.delete(k); } };
+	assert.equal(await 迁移地址列表({ KV: kv }, 'LINK.txt'), true, '首次应迁移');
+	assert.equal(store.get('LINK.txt'), 'old data', '数据应写入新键');
+	assert.ok(!store.has('/LINK.txt'), '旧键应删除');
+	assert.equal(await 迁移地址列表({ KV: kv }, 'LINK.txt'), false, '第二次不应再迁移');
+});
+
+await t('SUBMAXNODES: 节点行数超过上限时截断', async () => {
+	const TOKEN = '550e8400-e29b-41d4-a716-446655440000';
+	const store = new Map([['LINK.txt', [
+		'vless://00000000-0000-0000-0000-000000000000@1.2.3.4:443?type=tcp#a',
+		'trojan://pw@8.8.8.8:443#b',
+		'ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpwYXNz@7.7.7.7:8443#c',
+	].join('\n')]]);
+	const kv = { async get(k){ return store.get(k)||null; }, async put(k,v){ store.set(k,String(v)); }, async delete(k){ store.delete(k); } };
+	const env = { KV: kv, TOKEN: 'admin', SUBTOKEN: TOKEN, SUBMAXNODES: '2' };
+	const request = () => new Request('https://worker.example/sub?token=' + TOKEN, { headers: { 'User-Agent': 'CloudSub test' } });
+	const res = await worker.fetch(request(), env, { waitUntil() {} });
+	assert.equal(res.status, 200);
+	const decoded = Buffer.from(await res.text(), 'base64').toString('utf8');
+	const nodeLines = decoded.split('\n').filter(l => l.includes('://'));
+	assert.ok(nodeLines.length <= 2, `节点数应被截断到 SUBMAXNODES(实际 ${nodeLines.length})`);
+});
+
+await t('EXCLUDE: 排除指定订阅源不拉取', async () => {
+	const TOKEN = '550e8400-e29b-41d4-a716-446655440000';
+	const store = new Map([
+		['LINK.txt', 'https://bad.example.com/sub\nhttps://good.example.com/sub\n'],
+		['EXCLUDE.txt', 'bad.example.com'],
+	]);
+	const kv = { async get(k){ return store.get(k)||null; }, async put(k,v){ store.set(k,String(v)); }, async delete(k){ store.delete(k); } };
+	const originalFetch = globalThis.fetch;
+	const fetched = [];
+	globalThis.fetch = async input => {
+		const target = typeof input === 'string' ? input : input.url;
+		fetched.push(target.split('?')[0].split('#')[0]);
+		if (target.includes('good.example.com')) {
+			return new Response('vless://00000000-0000-0000-0000-000000000000@5.6.7.8:443?type=tcp#fromGood', { status: 200 });
+		}
+		throw new Error('unexpected fetch: ' + target);
+	};
+	try {
+		const env = { KV: kv, TOKEN: 'admin', SUBTOKEN: TOKEN };
+		const request = () => new Request('https://worker.example/sub?token=' + TOKEN, { headers: { 'User-Agent': 'CloudSub test' } });
+		const res = await worker.fetch(request(), env, { waitUntil() {} });
+		assert.equal(res.status, 200);
+		const decoded = Buffer.from(await res.text(), 'base64').toString('utf8');
+		assert.ok(decoded.includes('fromGood'), '应拉取未被排除的源');
+		assert.ok(!fetched.some(t => t.includes('bad.example.com')), '不应拉取被排除的源');
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
+await t('订阅响应 ETag: If-None-Match 命中返回 304', async () => {
+	const TOKEN = '550e8400-e29b-41d4-a716-446655440000';
+	const store = new Map([['LINK.txt', 'vless://00000000-0000-0000-0000-000000000000@1.2.3.4:443?type=tcp#e']]);
+	const kv = { async get(k){ return store.get(k)||null; }, async put(k,v){ store.set(k,String(v)); }, async delete(k){ store.delete(k); } };
+	const env = { KV: kv, TOKEN: 'admin', SUBTOKEN: TOKEN };
+	const first = await worker.fetch(new Request('https://worker.example/sub?token=' + TOKEN, { headers: { 'User-Agent': 'CloudSub test' } }), env, { waitUntil() {} });
+	assert.equal(first.status, 200);
+	const etag = first.headers.get('ETag');
+	assert.ok(etag, '响应应带 ETag');
+	const second = await worker.fetch(new Request('https://worker.example/sub?token=' + TOKEN, { headers: { 'User-Agent': 'CloudSub test', 'If-None-Match': etag } }), env, { waitUntil() {} });
+	assert.equal(second.status, 304, 'If-None-Match 命中应返回 304');
+});
+
+await t('SS 插件校验: 非法 obfs/v2ray mode 丢弃,缺失 mode 默认合法', async () => {
+	const b64ss = s => Buffer.from(s, 'utf8').toString('base64');
+	const bad1 = 'ss://' + b64ss('aes-128-gcm:pw') + '@1.2.3.4:8388?plugin=' + encodeURIComponent('obfs-local;obfs=on;obfs-host=h.com') + '#bad1';
+	const bad2 = 'ss://' + b64ss('aes-128-gcm:pw') + '@1.2.3.4:8388?plugin=' + encodeURIComponent('v2ray-plugin;mode=quic') + '#bad2';
+	const good1 = 'ss://' + b64ss('aes-128-gcm:pw') + '@1.2.3.4:8388?plugin=' + encodeURIComponent('obfs-local;obfs-host=h.com') + '#good1';
+	const good2 = 'ss://' + b64ss('aes-128-gcm:pw') + '@1.2.3.4:8388?plugin=' + encodeURIComponent('v2ray-plugin') + '#good2';
+	const cfg = await 生成本地Clash配置([bad1, bad2, good1, good2].join('\n'), {}, 'SSPlugin');
+	assert.ok(!cfg.includes('bad1'), 'obfs 非法模式(on)应丢弃节点,避免 mihomo obfs mode error 拖垮整个配置');
+	assert.ok(!cfg.includes('bad2'), 'v2ray-plugin 非法模式(quic)应丢弃节点');
+	assert.ok(cfg.includes('good1') && cfg.includes('mode: "http"'), 'obfs 缺失模式应默认 http 并保留');
+	assert.ok(cfg.includes('good2') && cfg.includes('mode: "websocket"'), 'v2ray-plugin 缺失模式应默认 websocket 并保留');
+});
+
+await t('SS cipher 白名单: mihomo 支持的加密保留,chacha20-poly1305 仍丢弃', async () => {
+	const b64ss = s => Buffer.from(s, 'utf8').toString('base64');
+	const mk = c => 'ss://' + b64ss(c + ':pw') + '@1.2.3.4:8388#' + c.replace(/-/g, '_');
+	const keep = ['aes-128-ccm', 'chacha8-ietf-poly1305', 'lea-256-gcm', 'aegis-256', 'aes-128-gcm-siv'];
+	const drop = ['chacha20-poly1305', 'aes-999-cfb'];
+	const cfg = await 生成本地Clash配置([...keep, ...drop].map(mk).join('\n'), {}, 'SSCipher');
+	for (const c of keep) assert.ok(cfg.includes('cipher: "' + c + '"'), c + ' 应被保留');
+	for (const c of drop) assert.ok(!cfg.includes('cipher: "' + c + '"'), c + ' 应被丢弃(mihomo 不支持)');
+});
+
+await t('协议字段校验: vmess cipher/alterId 非法值丢弃节点', async () => {
+	const b64 = s => Buffer.from(s, 'utf8').toString('base64');
+	const UUID = '00000000-0000-0000-0000-000000000000';
+	const vm = (o, n) => 'vmess://' + b64(JSON.stringify({ v: '2', ps: n, add: '1.2.3.4', port: '443', id: UUID, ...o })) + '#' + n;
+	const badCipher = vm({ scy: 'chacha20-ietf-poly1305' }, 'bad_cipher');
+	const badAid = vm({ aid: 'abc' }, 'bad_aid');
+	const good1 = vm({ scy: 'aes-128-gcm', aid: '64' }, 'good_cipher');
+	const good2 = vm({ scy: 'AUTO' }, 'good_auto');
+	const cfg = await 生成本地Clash配置([badCipher, badAid, good1, good2].join('\n'), {}, 'VMessCheck');
+	assert.ok(!cfg.includes('bad_cipher'), 'vmess 非法 cipher 应丢弃节点(mihomo 只认 auto/aes-128-gcm/chacha20-poly1305/none)');
+	assert.ok(!cfg.includes('bad_aid'), 'vmess 非数字 alterId 应丢弃节点');
+	assert.ok(cfg.includes('good_cipher') && cfg.includes('cipher: "aes-128-gcm"'), '合法 cipher 应保留');
+	assert.ok(cfg.includes('good_auto'), '大写 cipher 变体应保留');
+});
+
+await t('协议字段校验: hysteria2 obfs 仅接受 salamander+密码', async () => {
+	const text = [
+		'hysteria2://pw@1.2.3.4:443/?obfs=none&obfs-password=x#bad_obfs',
+		'hysteria2://pw@1.2.3.4:443/?obfs=salamander#bad_nopw',
+		'hysteria2://pw@1.2.3.4:443/?obfs=salamander&obfs-password=secret#good_obfs',
+		'hysteria2://pw@1.2.3.4:443/#good_plain',
+	].join('\n');
+	const cfg = await 生成本地Clash配置(text, {}, 'Hy2Check');
+	assert.ok(!cfg.includes('bad_obfs'), 'obfs=none 应丢弃节点');
+	assert.ok(!cfg.includes('bad_nopw'), 'obfs=salamander 缺密码应丢弃节点');
+	assert.ok(cfg.includes('good_obfs') && cfg.includes('obfs-password: "secret"'), 'salamander+密码应保留');
+	assert.ok(cfg.includes('good_plain'), '无 obfs 应保留');
+});
+
+await t('协议字段校验: hysteria v1 up/down 必须正整数,缺省给默认值', async () => {
+	const text = [
+		'hysteria://1.2.3.4:443/?auth=x&upmbps=0&downmbps=100#bad_up0',
+		'hysteria://1.2.3.4:443/?auth=x&upmbps=abc#bad_upabc',
+		'hysteria://1.2.3.4:443/?auth=x&upmbps=1.5&downmbps=100#bad_float',
+		'hysteria://1.2.3.4:443/?auth=x&upmbps=50&downmbps=200#good_num',
+		'hysteria://1.2.3.4:443/?auth=x#good_default',
+	].join('\n');
+	const cfg = await 生成本地Clash配置(text, {}, 'Hy1Check');
+	assert.ok(!cfg.includes('bad_up0'), 'up=0 应丢弃节点');
+	assert.ok(!cfg.includes('bad_upabc'), 'up 非数字应丢弃节点');
+	assert.ok(!cfg.includes('bad_float'), 'up 小数应丢弃节点');
+	assert.ok(cfg.includes('good_num') && cfg.includes('up: "50"'), '正整数 up/down 应保留');
+	assert.ok(cfg.includes('good_default'), '缺省 up/down 应保留并给默认值');
+});
+
+await t('协议字段校验: wireguard ip/reserved 非法值丢弃节点', async () => {
+	const b64 = s => Buffer.from(s, 'utf8').toString('base64');
+	const key = b64('a'.repeat(32)).replace(/=+$/, '');
+	const wg = (extra, n) => 'wireguard://1.2.3.4:443?pvtkey=' + key + '&pubkey=' + key + extra + '#' + n;
+	const cfg = await 生成本地Clash配置([
+		wg('&ip=10.0.0.2/32', 'bad_cidr'),
+		wg('&ip=2001:db8::1', 'bad_v6'),
+		wg('&ip=01.02.03.04', 'bad_leading'),
+		wg('&ip=999.999.999.999', 'bad_range'),
+		wg('&ip=10.0.0.2&reserved=1,2', 'bad_rlen'),
+		wg('&ip=10.0.0.2&reserved=1,2,999', 'bad_rval'),
+		wg('&ip=10.0.0.2', 'good_wg'),
+		wg('&ip=10.0.0.2&reserved=1,2,3', 'good_resv'),
+	].join('\n'), {}, 'WgCheck');
+	for (const n of ['bad_cidr', 'bad_v6', 'bad_leading', 'bad_range', 'bad_rlen', 'bad_rval']) {
+		assert.ok(!cfg.includes(n), n + ' 应丢弃节点(ip/reserved 非法会让 mihomo 拒绝加载整个配置)');
+	}
+	assert.ok(cfg.includes('good_wg'), '合法 ip 应保留');
+	assert.ok(cfg.includes('good_resv') && /reserved:\s*\n\s*- 1\s*\n\s*- 2\s*\n\s*- 3/.test(cfg), '合法 reserved(3字节)应保留');
+});
+
+await t('协议字段校验: anytls 数字字段必须正整数 + URI 尾部斜杠容忍', async () => {
+	const text = [
+		'anytls://pw@1.2.3.4:443/?idle-session-check-interval=abc#bad_idle',
+		'anytls://pw@1.2.3.4:443/?idle-session-timeout=0#bad_timeout',
+		'anytls://pw@1.2.3.4:443/?min-idle-session=5#good_min',
+		'anytls://pw@1.2.3.4:443/#good_anytls',
+		'hysteria2://pw@1.2.3.4:443/#good_slash',
+	].join('\n');
+	const cfg = await 生成本地Clash配置(text, {}, 'AnyTLSCheck');
+	assert.ok(!cfg.includes('bad_idle'), 'anytls 非数字字段应丢弃节点');
+	assert.ok(!cfg.includes('bad_timeout'), 'anytls 0 值应丢弃节点');
+	assert.ok(cfg.includes('good_min') && cfg.includes('min-idle-session: 5'), 'anytls 正整数应保留');
+	assert.ok(cfg.includes('good_anytls'), 'anytls 正常应保留');
+	assert.ok(cfg.includes('good_slash'), '带尾部斜杠的 URI 不应被误丢');
+});
+
+await t('管理页保存: saveProtocol/saveNocn 均保留 URL token 参数', async () => {
+	// 前端 JS 内嵌在 _worker.js 中,直接校验构建产物源码特征
+	const worker = fs.readFileSync(OUT, 'utf8');
+	assert.ok(!worker.includes("location.pathname + '?save=protocol'"), 'saveProtocol 不应再用 pathname(会丢 token)');
+	assert.ok(worker.includes("searchParams.set('save', 'protocol')"), 'saveProtocol 应保留完整 URL(含 token)');
+	assert.ok(worker.includes("searchParams.set('save', 'nocn')"), 'saveNocn 应保留完整 URL(含 token)');
+});
+
+await t('解析中国IP文本: CIDR 解析/合并 + 二分匹配(IPv4/IPv6)', async () => {
+	const list = [
+		'1.0.1.0/24',
+		'1.0.2.0/23', // 与上一段相邻,应被合并
+		'8.8.8.0/24',
+		'2001:db8::/32',
+		'# 注释行',
+		'非法行',
+	].join('\n');
+	const data = 解析中国IP文本(list);
+	assert.ok(data && data.v4.length === 2, '相邻 /24 与 /23 应合并为一段,共 2 段');
+	assert.equal(data.v4[0][0], 0x01000100, '起始 IP 应正确');
+	assert.equal(data.v4[0][1], 0x010003ff, '合并后的结束 IP 应正确');
+	assert.ok(中国IP匹配(data, '1.0.1.5'), '1.0.1.5 应命中');
+	assert.ok(中国IP匹配(data, '1.0.3.255'), '合并段边界应命中');
+	assert.ok(中国IP匹配(data, '8.8.8.8'), '8.8.8.8 应命中');
+	assert.ok(!中国IP匹配(data, '1.0.4.1'), '段外不应命中');
+	assert.ok(!中国IP匹配(data, '9.9.9.9'), '9.9.9.9 不应命中');
+	assert.ok(中国IP匹配(data, '2001:db8::1'), 'IPv6 应命中');
+	assert.ok(!中国IP匹配(data, '2001:db9::1'), 'IPv6 段外不应命中');
+});
+
+await t('节点服务器地址: vmess/ssr/明文/IPv6 提取', async () => {
+	assert.equal(节点服务器地址('vless://u@1.2.3.4:443?type=tcp#x'), '1.2.3.4');
+	assert.equal(节点服务器地址('vless://u@[2001:db8::1]:443#x'), '2001:db8::1');
+	assert.equal(节点服务器地址('ss://YWVzLTEyOC1nY206cA==@hk.example.com:8388#x'), 'hk.example.com');
+	const vmess = 'vmess://' + Buffer.from(JSON.stringify({ v: '2', ps: 'x', add: '5.6.7.8', port: '443', id: 'u' }), 'utf8').toString('base64');
+	assert.equal(节点服务器地址(vmess), '5.6.7.8');
+	assert.equal(节点服务器地址('vless://u@1.2.3.4:443#x'), '1.2.3.4');
+});
+
+await t('剔除大陆节点: IP 优先匹配,域名回退名称关键词', async () => {
+	const list = '1.0.1.5/24';
+	const data = 解析中国IP文本(list);
+	const text = [
+		'vless://u@1.0.1.5:443?type=tcp#东京', // 大陆 IP + 境外名 → IP 为准,剔除
+		'vless://u@1.0.1.5:443?type=tcp#香港01', // 大陆 IP + 港澳名 → IP 为准,剔除
+		'vless://u@8.8.8.8:443?type=tcp#上海-BGP', // 境外 IP + 大陆名 → IP 为准,保留
+		'vless://u@8.8.8.8:443?type=tcp#香港', // 境外 IP → 保留
+		'vless://u@hk.example.com:443?type=tcp#上海', // 域名 → 名称关键词,剔除
+		'vless://u@hk.example.com:443?type=tcp#香港', // 域名 → 名称关键词,保留
+		'trojan://pw@1.0.1.5:443#大陆-01', // 大陆 IP → 剔除
+	].join('\n');
+	const out = 剔除大陆节点(text, data);
+	const lines = out.split('\n').filter(l => l.includes('://'));
+	assert.ok(!lines.some(l => l.includes('1.0.1.5')), '大陆 IP 节点应全部剔除(名称无法豁免)');
+	assert.ok(!lines.some(l => l.includes('hk.example.com') && l.includes('上海')), '域名 + 大陆名应剔除');
+	assert.ok(lines.some(l => l.includes('8.8.8.8')), '境外 IP 节点应保留');
+	assert.ok(lines.some(l => l.includes('hk.example.com') && l.includes('香港')), '域名 + 港澳名应保留');
+});
+
+await t('剔除大陆节点: 无 IP 数据时回退纯名称关键词(兼容旧行为)', async () => {
+	const text = [
+		'vless://u@1.0.1.5:443?type=tcp#北京', // 大陆 IP 但无数据 → 名称判断剔除
+		'vless://u@1.0.1.5:443?type=tcp#东京', // 大陆 IP 无数据且无关键词 → 保留(旧行为)
+	].join('\n');
+	const out = 剔除大陆节点(text, null);
+	assert.ok(!out.includes('北京'), '名称含关键词应剔除');
+	assert.ok(out.includes('东京'), '无数据时按名称判断,应保留');
 });
 
 // ---- 输出汇总 ----

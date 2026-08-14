@@ -2,7 +2,7 @@
 // TOKEN 仅用于管理页面；SUBTOKEN/SUBUUID 用于客户端订阅请求。
 
 const DEFAULT_TOKEN = 'auto';
-const DEPLOY_VERSION = 'v2.7.6';
+const DEPLOY_VERSION = 'v2.8.1';
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const DEFAULT_FILE_NAME = 'CloudSub';
 const DEFAULT_UPDATE_TIME = 6;
@@ -20,6 +20,10 @@ const DEFAULT_MAX_SUB_SOURCES = 50;
 const DEFAULT_MAX_SUB_RESPONSE_BYTES = 10 * 1024 * 1024;
 const DEFAULT_MAX_SUB_TOTAL_BYTES = 40 * 1024 * 1024;
 const DEFAULT_SUB_FETCH_TIMEOUT_MS = 20000;
+// 聚合结果节点行数上限(默认 20000)。超大订阅(数万节点)会撑爆 KV 2MiB 缓存上限
+// 导致每次请求都全量重拉,这里按行数截断,保证缓存可用且响应可控。
+const DEFAULT_MAX_SUB_NODES = 20000;
+const HARD_MAX_SUB_NODES = 100000;
 const MAX_KV_CONTENT_BYTES = 2 * 1024 * 1024;
 // 环境变量可配置值的硬上限(避免误配导致 Worker 内存超限,免费版内存为 128MB)
 const HARD_MAX_SUB_RESPONSE_BYTES = 32 * 1024 * 1024;
