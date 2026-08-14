@@ -879,7 +879,7 @@ async function 有界并发执行(items, limit, fn) {
 
 async function getUrl(request, targetUrl, 追加UA, userAgentHeader, signal, 条件 = null) {
 	const newHeaders = new Headers();
-	newHeaders.set("User-Agent", `${atob('djJyYXlOLzYuNDU=')} cliechen/CloudSub ${追加UA}(${userAgentHeader || 'null'})`);
+	newHeaders.set("User-Agent", `${atob('djJyYXlOLzYuNDU=')} CloudSub ${追加UA}(${userAgentHeader || 'null'})`);
 	newHeaders.set("Accept", request.headers.get('Accept') || '*/*');
 
 	// 条件请求:带上次拉取的 ETag / Last-Modified,上游若返回 304 表示内容未变化,
