@@ -303,7 +303,8 @@ async function 生成本地Singbox配置(节点文本, env, fileName = DEFAULT_F
 		{ type: 'selector', tag: 漏网, outbounds: [节点选择, 直连] },
 	];
 	// 法国节点单独成组(FR-only 订阅模式下整份即为法国节点,无需再建分组)
-	if (frNames.length && !FRonly) groups.push({ type: 'selector', tag: 法国组, outbounds: [...frNames, 节点选择] });
+	// 避免循环: 节点选择已包含 法国组,回退改为 自动选择(无循环)
+	if (frNames.length && !FRonly) groups.push({ type: 'selector', tag: 法国组, outbounds: [...frNames, 自动选择] });
 	outbounds.push(...groups);
 
 	const config = {

@@ -2471,7 +2471,8 @@ async function 生成本地Singbox配置(节点文本, env, fileName = DEFAULT_F
 		{ type: 'selector', tag: 漏网, outbounds: [节点选择, 直连] },
 	];
 	// 法国节点单独成组(FR-only 订阅模式下整份即为法国节点,无需再建分组)
-	if (frNames.length && !FRonly) groups.push({ type: 'selector', tag: 法国组, outbounds: [...frNames, 节点选择] });
+	// 避免循环: 节点选择已包含 法国组,回退改为 自动选择(无循环)
+	if (frNames.length && !FRonly) groups.push({ type: 'selector', tag: 法国组, outbounds: [...frNames, 自动选择] });
 	outbounds.push(...groups);
 
 	const config = {
@@ -3134,7 +3135,8 @@ async function 生成本地Clash配置(节点文本, env, fileName = DEFAULT_FIL
 		{ name: 漏网, type: 'select', proxies: [节点选择, 直连] },
 	];
 	// 法国节点单独成组(FR-only 订阅模式下整份即为法国节点,无需再建分组)
-	if (frNames.length && !FRonly) groups.push({ name: 法国组, type: 'select', proxies: [...frNames, 节点选择] });
+	// 避免与 节点选择 形成循环引用(节点选择 -> 法国组 -> 节点选择 会被 mihomo 判为 circular),回退改为 自动选择
+	if (frNames.length && !FRonly) groups.push({ name: 法国组, type: 'select', proxies: [...frNames, 自动选择] });
 
 	const rules = await 获取Clash规则(env);
 
@@ -3345,8 +3347,8 @@ async function 生成本地Surge配置(节点文本, env, fileName = DEFAULT_FIL
 		Ai + ' = select, ' + [节点选择, 直连].map(q).join(', '),
 		漏网 + ' = select, ' + [节点选择, 直连].map(q).join(', '),
 	];
-	// 法国节点单独成组(FR-only 订阅模式下整份即为法国节点)
-	if (frNames.length && !FRonly) groups.push(法国组 + ' = select, ' + [...frNames, 节点选择].map(q).join(', '));
+	// 法国节点单独成组(FR-only 订阅模式下整份即为法国节点),回退用 自动选择 避免与 节点选择 循环
+	if (frNames.length && !FRonly) groups.push(法国组 + ' = select, ' + [...frNames, 自动选择].map(q).join(', '));
 
 	// 规则复用 Clash 的 KV 缓存规则集,只需把结尾的 MATCH 换成 Surge 的 FINAL
 	const rules = (await 获取Clash规则(env)).map(r => r.startsWith('MATCH,') ? 'FINAL,' + r.slice(6) : r);
@@ -3559,8 +3561,8 @@ async function 生成本地Quanx配置(节点文本, env, fileName = DEFAULT_FIL
 		'static=' + Ai + ', ' + [节点选择, 直连].map(qxq).join(', '),
 		'static=' + 漏网 + ', ' + [节点选择, 直连].map(qxq).join(', '),
 	];
-	// 法国节点单独成组(FR-only 订阅模式下整份即为法国节点)
-	if (frNames.length && !FRonly) policies.push('static=' + 法国组 + ', ' + [...frNames, 节点选择].map(qxq).join(', '));
+	// 法国节点单独成组(FR-only 订阅模式下整份即为法国节点),回退改为 自动选择 避免循环
+	if (frNames.length && !FRonly) policies.push('static=' + 法国组 + ', ' + [...frNames, 自动选择].map(qxq).join(', '));
 
 	// 规则复用 Clash 的 KV 缓存规则集,转换为 QX 语法
 	const rules = (await 获取Clash规则(env))
@@ -3772,8 +3774,8 @@ async function 生成本地Loon配置(节点文本, env, fileName = DEFAULT_FILE
 		Ai + ' = select, ' + [节点选择, 直连].map(loonq).join(', '),
 		漏网 + ' = select, ' + [节点选择, 直连].map(loonq).join(', '),
 	];
-	// 法国节点单立成组(FR-only 订阅模式下整份即为法国节点)
-	if (frNames.length && !FRonly) groups.push(法国组 + ' = select, ' + [...frNames, 节点选择].map(loonq).join(', '));
+	// 法国节点单立成组(FR-only 订阅模式下整份即为法国节点),回退改为 自动选择 避免循环
+	if (frNames.length && !FRonly) groups.push(法国组 + ' = select, ' + [...frNames, 自动选择].map(loonq).join(', '));
 
 	const rules = (await 获取Clash规则(env)).map(clashRuleToLoon);
 	if (!rules.some(r => r.startsWith('FINAL,'))) rules.push('FINAL,' + 漏网);
