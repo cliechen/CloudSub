@@ -234,6 +234,24 @@ async function KV(request, env, txt = 'ADD.txt', { subscriptionToken, fileName }
 					loon订阅地址:<br>
 					<a href="javascript:void(0)" onclick="copyToClipboard('https://${url.hostname}/sub?token=${subscriptionToken}&loon','qrcode_5')" style="color:blue;text-decoration:underline;cursor:pointer;">https://${url.hostname}/sub?token=${subscriptionToken}&loon</a><br>
 					<div id="qrcode_5" style="margin: 10px 10px 10px 10px;"></div>
+					&nbsp;<br>
+					<strong style="color:#c0392b">🇫🇷 法国节点订阅 (French-only) — &fr 仅保留法国节点</strong><br>
+					---------------------------------------------------------------<br>
+					自适应(Base64)法国订阅:<br>
+					<a href="javascript:void(0)" onclick="copyToClipboard('https://${url.hostname}/sub?token=${subscriptionToken}&fr','qrcode_fr0')" style="color:blue;text-decoration:underline;cursor:pointer;">https://${url.hostname}/sub?token=${subscriptionToken}&fr</a><br>
+					<div id="qrcode_fr0" style="margin: 10px 10px 10px 10px;"></div>
+					clash法国订阅:<br>
+					<a href="javascript:void(0)" onclick="copyToClipboard('https://${url.hostname}/sub?token=${subscriptionToken}&clash&fr','qrcode_fr1')" style="color:blue;text-decoration:underline;cursor:pointer;">https://${url.hostname}/sub?token=${subscriptionToken}&clash&fr</a><br>
+					<div id="qrcode_fr1" style="margin: 10px 10px 10px 10px;"></div>
+					singbox法国订阅:<br>
+					<a href="javascript:void(0)" onclick="copyToClipboard('https://${url.hostname}/sub?token=${subscriptionToken}&sb&fr','qrcode_fr2')" style="color:blue;text-decoration:underline;cursor:pointer;">https://${url.hostname}/sub?token=${subscriptionToken}&sb&fr</a><br>
+					<div id="qrcode_fr2" style="margin: 10px 10px 10px 10px;"></div>
+					surge法国订阅:<br>
+					<a href="javascript:void(0)" onclick="copyToClipboard('https://${url.hostname}/sub?token=${subscriptionToken}&surge&fr','qrcode_fr3')" style="color:blue;text-decoration:underline;cursor:pointer;">https://${url.hostname}/sub?token=${subscriptionToken}&surge&fr</a><br>
+					<div id="qrcode_fr3" style="margin: 10px 10px 10px 10px;"></div>
+					loon法国订阅:<br>
+					<a href="javascript:void(0)" onclick="copyToClipboard('https://${url.hostname}/sub?token=${subscriptionToken}&loon&fr','qrcode_fr4')" style="color:blue;text-decoration:underline;cursor:pointer;">https://${url.hostname}/sub?token=${subscriptionToken}&loon&fr</a><br>
+					<div id="qrcode_fr4" style="margin: 10px 10px 10px 10px;"></div>
 					&nbsp;&nbsp;<strong><a href="javascript:void(0);" id="noticeToggle" onclick="toggleNotice()">查看访客订阅∨</a></strong><br>
 					<div id="noticeContent" class="notice-content" style="display: none;">
 						---------------------------------------------------------------<br>
@@ -258,6 +276,24 @@ async function KV(request, env, txt = 'ADD.txt', { subscriptionToken, fileName }
 						loon订阅地址:<br>
 						<a href="javascript:void(0)" onclick="copyToClipboard('https://${url.hostname}/sub?token=${subscriptionToken}&loon','guest_5')" style="color:blue;text-decoration:underline;cursor:pointer;">https://${url.hostname}/sub?token=${subscriptionToken}&loon</a><br>
 						<div id="guest_5" style="margin: 10px 10px 10px 10px;"></div>
+						&nbsp;<br>
+						<strong style="color:#c0392b">🇫🇷 法国节点订阅 (French-only)</strong><br>
+						---------------------------------------------------------------<br>
+						自适应(Base64)法国订阅地址:<br>
+						<a href="javascript:void(0)" onclick="copyToClipboard('https://${url.hostname}/sub?token=${subscriptionToken}&fr','guest_fr0')" style="color:blue;text-decoration:underline;cursor:pointer;">https://${url.hostname}/sub?token=${subscriptionToken}&fr</a><br>
+						<div id="guest_fr0" style="margin: 10px 10px 10px 10px;"></div>
+						clash法国订阅地址:<br>
+						<a href="javascript:void(0)" onclick="copyToClipboard('https://${url.hostname}/sub?token=${subscriptionToken}&clash&fr','guest_fr1')" style="color:blue;text-decoration:underline;cursor:pointer;">https://${url.hostname}/sub?token=${subscriptionToken}&clash&fr</a><br>
+						<div id="guest_fr1" style="margin: 10px 10px 10px 10px;"></div>
+						singbox法国订阅地址:<br>
+						<a href="javascript:void(0)" onclick="copyToClipboard('https://${url.hostname}/sub?token=${subscriptionToken}&sb&fr','guest_fr2')" style="color:blue;text-decoration:underline;cursor:pointer;">https://${url.hostname}/sub?token=${subscriptionToken}&sb&fr</a><br>
+						<div id="guest_fr2" style="margin: 10px 10px 10px 10px;"></div>
+						surge法国订阅地址:<br>
+						<a href="javascript:void(0)" onclick="copyToClipboard('https://${url.hostname}/sub?token=${subscriptionToken}&surge&fr','guest_fr3')" style="color:blue;text-decoration:underline;cursor:pointer;">https://${url.hostname}/sub?token=${subscriptionToken}&surge&fr</a><br>
+						<div id="guest_fr3" style="margin: 10px 10px 10px 10px;"></div>
+						loon法国订阅地址:<br>
+						<a href="javascript:void(0)" onclick="copyToClipboard('https://${url.hostname}/sub?token=${subscriptionToken}&loon&fr','guest_fr4')" style="color:blue;text-decoration:underline;cursor:pointer;">https://${url.hostname}/sub?token=${subscriptionToken}&loon&fr</a><br>
+						<div id="guest_fr4" style="margin: 10px 10px 10px 10px;"></div>
 					</div>
 					---------------------------------------------------------------<br>
 					################################################################<br>

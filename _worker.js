@@ -374,8 +374,8 @@ export default {
 			//  4) 防惊群锁:缓存 cold 时仅一个请求承担全量拉取,其余等待读取结果。
 			// 追加 &refresh 强制重建;未绑定 KV 时退化为实时聚合。
 			// 缓存因子附带中国 IP 数据版本:IP 段更新后自动生成新缓存键,避免复用旧 GeoIP 结果;
-			// 屏蔽词同样纳入:配置变化后自动生成新缓存键,不复用旧结果
-			const 缓存因子 = [MainData, 订阅链接数组.join('\n'), [...协议过滤].sort().join(','), env.WARP || '', 剔除大陆 ? '1:' + (中国IP数据?.版本 || '0') : '0', [...屏蔽词].sort().join(',')].join('\u0001');
+			// 屏蔽词、节点上限同样纳入:配置变化后自动生成新缓存键,不复用旧结果(否则 SUBMAXNODES 调小后仍返回旧的大截断结果)
+			const 缓存因子 = [MainData, 订阅链接数组.join('\n'), [...协议过滤].sort().join(','), env.WARP || '', 剔除大陆 ? '1:' + (中国IP数据?.版本 || '0') : '0', [...屏蔽词].sort().join(','), String(拉取限制.nodes)].join('\u0001');
 			const 缓存键 = await hashText(缓存因子);
 			const KV缓存键 = 'SUB_AGG:' + 缓存键;
 			const 时间戳键 = 'SUB_AGG_AT:' + 缓存键;
@@ -445,6 +445,13 @@ export default {
 
 
 			// 构建响应头对象
+			const FRonly = url.searchParams.has('fr');
+			// ?fr:仅保留法国节点(白名单)。法国 GeoIP/名称二路分类,IP 匹配走获取法国IP数据。
+			// 法国专属订阅复用聚合缓存(SUB_AGG),仅格式成品走独立 FMT:fr: 缓存键(含 IP 数据版本)。
+			const frIpData = FRonly ? await 获取法国IP数据(env) : null;
+			const 输出结果 = FRonly ? 仅保留法国节点(过滤结果, frIpData) : 过滤结果;
+			const FMT前缀 = 'FMT:' + (FRonly ? ('fr:' + (frIpData && frIpData.版本 ? frIpData.版本 : '0') + ':') : '') + 缓存键;
+
 			const responseHeaders = {
 				"content-type": "text/plain; charset=utf-8",
 				"cache-control": "private, no-store",
@@ -456,9 +463,9 @@ export default {
 			};
 
 			// ===== 订阅响应 ETag:支持客户端条件请求 =====
-			// ETag 取「过滤结果 + 格式」的哈希:内容或格式变化时 ETag 才变化;
+			// ETag 取「输出结果 + 格式」的哈希:内容或格式变化时 ETag 才变化;
 			// 客户端带 If-None-Match 且未变化时直接返回 304,不重复生成/编码配置。
-			const 内容ETag = '"' + await hashText(过滤结果 + ':' + 订阅格式) + '"';
+			const 内容ETag = '"' + await hashText(输出结果 + ':' + 订阅格式 + (FRonly ? ':fr' : '')) + '"';
 			responseHeaders["ETag"] = 内容ETag;
 			if (request.headers.get('If-None-Match') === 内容ETag) {
 				return new Response(null, {
@@ -476,10 +483,10 @@ export default {
 				// 避免对 2MB 级大订阅每次做一次无谓的 base64 编码。
 				let base64Data;
 				try {
-					base64Data = btoa(过滤结果);
+					base64Data = btoa(输出结果);
 				} catch (e) {
 					// btoa 对非 Latin1 字符串抛错,回退为 UTF-8 -> base64(处理含中文的订阅名)
-					const binary = new TextEncoder().encode(过滤结果);
+					const binary = new TextEncoder().encode(输出结果);
 					let base64 = '';
 					const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 					for (let i = 0; i < binary.length; i += 3) {
@@ -498,34 +505,34 @@ export default {
 			} else if (订阅格式 == 'clash') {
 				// ===== 方案A:本地生成 Clash 配置,不依赖第三方 SUBAPI =====
 				// 分流规则优先使用 KV 缓存的 ACL4SSR 规则集,无 KV 时回退内置精简规则
-				const 本地Clash配置 = await 生成配置缓存('FMT:' + 缓存键 + ':clash:' + fileName, () => 生成本地Clash配置(过滤结果, env, fileName), 强制刷新);
+				const 本地Clash配置 = await 生成配置缓存(FMT前缀 + ':clash:' + fileName, () => 生成本地Clash配置(输出结果, env, fileName, FRonly), 强制刷新);
 				if (!userAgent.includes('mozilla')) responseHeaders["Content-Disposition"] = `attachment; filename*=utf-8''${encodeURIComponent(fileName)}`;
 				return new Response(本地Clash配置, { headers: responseHeaders });
 			} else if (订阅格式 == 'singbox') {
 				// ===== 方案A:本地生成 sing-box 配置,不依赖第三方 SUBAPI =====
 				// 复用 uriToClashProxy 解析节点,再转换为 sing-box outbounds + route
-				const 本地Singbox配置 = await 生成配置缓存('FMT:' + 缓存键 + ':singbox:' + fileName, () => 生成本地Singbox配置(过滤结果, env, fileName), 强制刷新);
+				const 本地Singbox配置 = await 生成配置缓存(FMT前缀 + ':singbox:' + fileName, () => 生成本地Singbox配置(输出结果, env, fileName, FRonly), 强制刷新);
 				if (!userAgent.includes('mozilla')) responseHeaders["Content-Disposition"] = `attachment; filename*=utf-8''${encodeURIComponent(fileName)}`;
 				return new Response(本地Singbox配置, { headers: responseHeaders });
 			} else if (订阅格式 == 'surge') {
 				// ===== 方案A:本地生成 Surge 配置,不依赖第三方 SUBAPI =====
 				// 复用 uriToClashProxy 解析节点,转换为 Surge [Proxy] + [Proxy Group] + [Rule]
 				// 注意:Surge 不支持 vless / ssr / hysteria(v1),这些协议的节点会被自动跳过
-				const 本地Surge配置 = await 生成配置缓存('FMT:' + 缓存键 + ':surge:' + fileName, () => 生成本地Surge配置(过滤结果, env, fileName, request.url), 强制刷新);
+				const 本地Surge配置 = await 生成配置缓存(FMT前缀 + ':surge:' + fileName, () => 生成本地Surge配置(输出结果, env, fileName, request.url, FRonly), 强制刷新);
 				if (!userAgent.includes('mozilla')) responseHeaders["Content-Disposition"] = `attachment; filename*=utf-8''${encodeURIComponent(fileName)}`;
 				return new Response(本地Surge配置, { headers: responseHeaders });
 			} else if (订阅格式 == 'quanx') {
 				// ===== 方案A:本地生成 Quantumult X 配置,不依赖第三方 SUBAPI =====
 				// 复用 uriToClashProxy 解析节点,转换为 [server_local] + [policy] + [filter_local]
 				// 注意:QX 不支持 tuic/wireguard/socks5/anytls,这些协议节点会被自动跳过
-				const 本地Quanx配置 = await 生成配置缓存('FMT:' + 缓存键 + ':quanx:' + fileName, () => 生成本地Quanx配置(过滤结果, env, fileName), 强制刷新);
+				const 本地Quanx配置 = await 生成配置缓存(FMT前缀 + ':quanx:' + fileName, () => 生成本地Quanx配置(输出结果, env, fileName, FRonly), 强制刷新);
 				if (!userAgent.includes('mozilla')) responseHeaders["Content-Disposition"] = `attachment; filename*=utf-8''${encodeURIComponent(fileName)}`;
 				return new Response(本地Quanx配置, { headers: responseHeaders });
 			} else if (订阅格式 == 'loon') {
 				// ===== 方案A:本地生成 Loon 配置,不依赖第三方 SUBAPI =====
 				// 复用 uriToClashProxy 解析节点,转换为 [Proxy] + [Proxy Group] + [Rule]
 				// 注意:Loon 不支持 socks5/tuic/anytls,这些协议节点会被自动跳过
-				const 本地Loon配置 = await 生成配置缓存('FMT:' + 缓存键 + ':loon:' + fileName, () => 生成本地Loon配置(过滤结果, env, fileName), 强制刷新);
+				const 本地Loon配置 = await 生成配置缓存(FMT前缀 + ':loon:' + fileName, () => 生成本地Loon配置(输出结果, env, fileName, FRonly), 强制刷新);
 				if (!userAgent.includes('mozilla')) responseHeaders["Content-Disposition"] = `attachment; filename*=utf-8''${encodeURIComponent(fileName)}`;
 				return new Response(本地Loon配置, { headers: responseHeaders });
 			}
@@ -2406,21 +2413,27 @@ function 校验节点(p) {
 }
 
 // 本地生成完整 sing-box JSON 配置
-async function 生成本地Singbox配置(节点文本, env, fileName = DEFAULT_FILE_NAME) {
+async function 生成本地Singbox配置(节点文本, env, fileName = DEFAULT_FILE_NAME, FRonly = false) {
 	const lines = String(节点文本 || '').split('\n').map(s => s.trim()).filter(Boolean);
 	const outbounds = [];
 	const endpoints = [];
+	const frOutIndices = [];
+	const frEpIndices = [];
 	for (const line of lines) {
 		let p;
 		try { p = uriToClashProxy(line); } catch (e) { p = null; } // 单节点解析失败只跳过该节点
 		if (!p || !校验节点(p)) continue; // 协议级校验:不合格节点宁缺毋滥
 		if (p.type === 'wireguard') {
 			const ep = clashToSingboxEndpoint(p);
-			if (ep) endpoints.push(ep);
+			if (!ep) continue;
+			if (!FRonly && 是否法国节点(line, null)) frEpIndices.push(endpoints.length);
+			endpoints.push(ep);
 			continue;
 		}
 		const o = clashToSingboxOutbound(p);
-		if (o) outbounds.push(o);
+		if (!o) continue;
+		if (!FRonly && 是否法国节点(line, null)) frOutIndices.push(outbounds.length);
+		outbounds.push(o);
 	}
 	if (outbounds.length === 0 && endpoints.length === 0) return JSON.stringify({ log: { level: 'info' }, outbounds: [] });
 
@@ -2435,6 +2448,7 @@ async function 生成本地Singbox配置(节点文本, env, fileName = DEFAULT_F
 		o.tag = t;
 	}
 	const nodeTags = allNodes.map(o => o.tag);
+	const frNames = [...frOutIndices.map(i => allNodes[i].tag), ...frEpIndices.map(i => allNodes[outbounds.length + i].tag)];
 
 	const 直连 = '🎯 全球直连';
 	const 拦截 = '🛑 全球拦截';
@@ -2445,8 +2459,9 @@ async function 生成本地Singbox配置(节点文本, env, fileName = DEFAULT_F
 	const 自动选择 = '♻️ 自动选择';
 	const 漏网 = '🐟 漏网之鱼';
 
+	const 法国组 = '🇫🇷 法国节点';
 	const groups = [
-		{ type: 'selector', tag: 节点选择, outbounds: [自动选择, ...nodeTags, 直连] },
+		{ type: 'selector', tag: 节点选择, outbounds: [自动选择, ...nodeTags, ...(frNames.length ? [法国组] : []), 直连] },
 		{ type: 'urltest', tag: 自动选择, outbounds: nodeTags, url: 'http://www.gstatic.com/generate_204', interval: '300s' },
 		{ type: 'direct', tag: 直连 },
 		{ type: 'block', tag: 拦截 },
@@ -2455,6 +2470,8 @@ async function 生成本地Singbox配置(节点文本, env, fileName = DEFAULT_F
 		{ type: 'selector', tag: Ai, outbounds: [节点选择, 直连] },
 		{ type: 'selector', tag: 漏网, outbounds: [节点选择, 直连] },
 	];
+	// 法国节点单独成组(FR-only 订阅模式下整份即为法国节点,无需再建分组)
+	if (frNames.length && !FRonly) groups.push({ type: 'selector', tag: 法国组, outbounds: [...frNames, 节点选择] });
 	outbounds.push(...groups);
 
 	const config = {
@@ -3069,13 +3086,17 @@ async function 获取Clash规则(env) {
 }
 
 // ===== 本地生成完整 Clash YAML =====
-async function 生成本地Clash配置(节点文本, env, fileName = DEFAULT_FILE_NAME) {
+async function 生成本地Clash配置(节点文本, env, fileName = DEFAULT_FILE_NAME, FRonly = false) {
 	const lines = String(节点文本 || '').split('\n').map(s => s.trim()).filter(Boolean);
 	const proxies = [];
+	const frIndices = [];
 	for (const line of lines) {
 		let p;
 		try { p = uriToClashProxy(line); } catch (e) { p = null; } // 单节点解析失败只跳过该节点
-		if (p && 校验节点(p)) proxies.push(p); // 协议级校验:不合格节点宁缺毋滥
+		if (p && 校验节点(p)) { // 校验合法才收入
+			if (!FRonly && 是否法国节点(line, null)) frIndices.push(proxies.length);
+			proxies.push(p);
+		}
 	}
 	if (proxies.length === 0) return '# 无可用节点\n';
 
@@ -3090,7 +3111,8 @@ async function 生成本地Clash配置(节点文本, env, fileName = DEFAULT_FIL
 	const 节点选择 = '🚀 节点选择';
 	const 自动选择 = '♻️ 自动选择';
 	const 漏网 = '🐟 漏网之鱼';
-	const seenNames = new Set(['DIRECT', 'REJECT', 'PASS', 'COMPATIBLE', 'REJECT-DROP', 直连, 拦截, 媒体, 电报, Ai, 节点选择, 自动选择, 漏网]);
+	const 法国组 = '🇫🇷 法国节点';
+	const seenNames = new Set(['DIRECT', 'REJECT', 'PASS', 'COMPATIBLE', 'REJECT-DROP', 直连, 拦截, 媒体, 电报, Ai, 节点选择, 自动选择, 漏网, 法国组]);
 	for (const p of proxies) {
 		let n = p.name;
 		let i = 2;
@@ -3099,9 +3121,10 @@ async function 生成本地Clash配置(节点文本, env, fileName = DEFAULT_FIL
 		p.name = n;
 	}
 	const nodeNames = proxies.map(p => p.name);
+	const frNames = frIndices.map(i => proxies[i].name);
 
 	const groups = [
-		{ name: 节点选择, type: 'select', proxies: [自动选择, ...nodeNames, 直连] },
+		{ name: 节点选择, type: 'select', proxies: [自动选择, ...nodeNames, ...(frNames.length ? [法国组] : []), 直连] },
 		{ name: 自动选择, type: 'url-test', url: 'http://www.gstatic.com/generate_204', interval: 300, tolerance: 50, proxies: nodeNames },
 		{ name: 直连, type: 'select', proxies: ['DIRECT'] },
 		{ name: 拦截, type: 'select', proxies: ['REJECT', 'DIRECT'] },
@@ -3110,6 +3133,8 @@ async function 生成本地Clash配置(节点文本, env, fileName = DEFAULT_FIL
 		{ name: Ai, type: 'select', proxies: [节点选择, 直连] },
 		{ name: 漏网, type: 'select', proxies: [节点选择, 直连] },
 	];
+	// 法国节点单独成组(FR-only 订阅模式下整份即为法国节点,无需再建分组)
+	if (frNames.length && !FRonly) groups.push({ name: 法国组, type: 'select', proxies: [...frNames, 节点选择] });
 
 	const rules = await 获取Clash规则(env);
 
@@ -3263,11 +3288,12 @@ function clashToSurgeProxy(p, wgIndex) {
 }
 
 // 本地生成完整 Surge 配置文本
-async function 生成本地Surge配置(节点文本, env, fileName = DEFAULT_FILE_NAME, 订阅地址 = '') {
+async function 生成本地Surge配置(节点文本, env, fileName = DEFAULT_FILE_NAME, 订阅地址 = '', FRonly = false) {
 	const lines = String(节点文本 || '').split('\n').map(s => s.trim()).filter(Boolean);
 	const proxyLines = [];
 	const wgSections = [];
 	const names = [];
+	const frIndices = [];
 	let wgIndex = 0;
 	for (const line of lines) {
 		let p;
@@ -3277,12 +3303,13 @@ async function 生成本地Surge配置(节点文本, env, fileName = DEFAULT_FIL
 		if (!r) continue;
 		if (r.wgSection) { wgSections.push(r.wgSection); wgIndex++; }
 		proxyLines.push(r.line);
+		if (!FRonly && 是否法国节点(line, null)) frIndices.push(names.length);
 		names.push(r.name);
 	}
 	if (proxyLines.length === 0) return '# 无可用节点\n';
 
 	// 节点名去重(Surge 要求唯一),同步更新对应的 [Proxy] 行;同时规避 DIRECT/REJECT 等内置保留名
-	const seenNames = new Set(['DIRECT', 'REJECT', 'PASS', 'COMPATIBLE', 'REJECT-DROP', '🎯 全球直连', '🛑 全球拦截', '🌍 国外媒体', '📲 电报信息', '💬 Ai平台', '🚀 节点选择', '♻️ 自动选择', '🐟 漏网之鱼']);
+	const seenNames = new Set(['DIRECT', 'REJECT', 'PASS', 'COMPATIBLE', 'REJECT-DROP', '🎯 全球直连', '🛑 全球拦截', '🌍 国外媒体', '📲 电报信息', '💬 Ai平台', '🚀 节点选择', '♻️ 自动选择', '🐟 漏网之鱼', '🇫🇷 法国节点']);
 	for (let i = 0; i < names.length; i++) {
 		let n = names[i];
 		let k = 2;
@@ -3304,10 +3331,12 @@ async function 生成本地Surge配置(节点文本, env, fileName = DEFAULT_FIL
 	const 节点选择 = '🚀 节点选择';
 	const 自动选择 = '♻️ 自动选择';
 	const 漏网 = '🐟 漏网之鱼';
+	const frNames = frIndices.map(i => names[i]);
+	const 法国组 = '🇫🇷 法国节点';
 	const q = v => surgeQuote(v);
 
 	const groups = [
-		节点选择 + ' = select, ' + [自动选择, ...names, 直连].map(q).join(', '),
+		节点选择 + ' = select, ' + [自动选择, ...names, ...(frNames.length ? [法国组] : []), 直连].map(q).join(', '),
 		自动选择 + ' = url-test, ' + names.map(q).join(', ') + ', url=http://www.gstatic.com/generate_204, interval=300, tolerance=100',
 		直连 + ' = select, DIRECT',
 		拦截 + ' = select, REJECT',
@@ -3316,6 +3345,8 @@ async function 生成本地Surge配置(节点文本, env, fileName = DEFAULT_FIL
 		Ai + ' = select, ' + [节点选择, 直连].map(q).join(', '),
 		漏网 + ' = select, ' + [节点选择, 直连].map(q).join(', '),
 	];
+	// 法国节点单独成组(FR-only 订阅模式下整份即为法国节点)
+	if (frNames.length && !FRonly) groups.push(法国组 + ' = select, ' + [...frNames, 节点选择].map(q).join(', '));
 
 	// 规则复用 Clash 的 KV 缓存规则集,只需把结尾的 MATCH 换成 Surge 的 FINAL
 	const rules = (await 获取Clash规则(env)).map(r => r.startsWith('MATCH,') ? 'FINAL,' + r.slice(6) : r);
@@ -3477,10 +3508,11 @@ function clashRuleToQuanx(r) {
 }
 
 // 本地生成完整 Quantumult X 配置
-async function 生成本地Quanx配置(节点文本, env, fileName = DEFAULT_FILE_NAME) {
+async function 生成本地Quanx配置(节点文本, env, fileName = DEFAULT_FILE_NAME, FRonly = false) {
 	const lines = String(节点文本 || '').split('\n').map(s => s.trim()).filter(Boolean);
 	const servers = [];
 	const names = [];
+	const frIndices = [];
 	for (const line of lines) {
 		let p;
 		try { p = uriToClashProxy(line); } catch (e) { p = null; } // 单节点解析失败只跳过该节点
@@ -3488,12 +3520,13 @@ async function 生成本地Quanx配置(节点文本, env, fileName = DEFAULT_FIL
 		const s = clashToQuanxServer(p);
 		if (!s) continue;
 		servers.push(s);
+		if (!FRonly && 是否法国节点(line, null)) frIndices.push(names.length);
 		names.push(p.name || (p.server + ':' + p.port));
 	}
 	if (servers.length === 0) return '# 无可用节点\n';
 
 	// 节点名去重(QX 的 tag 需唯一);同时规避内置保留名
-	const seenNames = new Set(['DIRECT', 'REJECT', 'PASS', 'COMPATIBLE', 'REJECT-DROP', 'direct', 'reject', 'proxy', '🎯 全球直连', '🛑 全球拦截', '🌍 国外媒体', '📲 电报信息', '💬 Ai平台', '🚀 节点选择', '♻️ 自动选择', '🐟 漏网之鱼']);
+	const seenNames = new Set(['DIRECT', 'REJECT', 'PASS', 'COMPATIBLE', 'REJECT-DROP', 'direct', 'reject', 'proxy', '🎯 全球直连', '🛑 全球拦截', '🌍 国外媒体', '📲 电报信息', '💬 Ai平台', '🚀 节点选择', '♻️ 自动选择', '🐟 漏网之鱼', '🇫🇷 法国节点']);
 	for (let i = 0; i < names.length; i++) {
 		let n = names[i];
 		let k = 2;
@@ -3513,9 +3546,11 @@ async function 生成本地Quanx配置(节点文本, env, fileName = DEFAULT_FIL
 	const 自动选择 = '♻️ 自动选择';
 	const 漏网 = '🐟 漏网之鱼';
 
+	const frNames = frIndices.map(i => names[i]);
+	const 法国组 = '🇫🇷 法国节点';
 	const qxq = v => qxQuote(v);
 	const policies = [
-		'static=' + 节点选择 + ', ' + [自动选择, ...names, 直连].map(qxq).join(', '),
+		'static=' + 节点选择 + ', ' + [自动选择, ...names, ...(frNames.length ? [法国组] : []), 直连].map(qxq).join(', '),
 		'url-latency-benchmark=' + 自动选择 + ', ' + names.map(qxq).join(', ') + ', check-interval=300, alive-checking=true, tolerance=0',
 		'static=' + 直连 + ', direct',
 		'static=' + 拦截 + ', reject',
@@ -3524,6 +3559,8 @@ async function 生成本地Quanx配置(节点文本, env, fileName = DEFAULT_FIL
 		'static=' + Ai + ', ' + [节点选择, 直连].map(qxq).join(', '),
 		'static=' + 漏网 + ', ' + [节点选择, 直连].map(qxq).join(', '),
 	];
+	// 法国节点单独成组(FR-only 订阅模式下整份即为法国节点)
+	if (frNames.length && !FRonly) policies.push('static=' + 法国组 + ', ' + [...frNames, 节点选择].map(qxq).join(', '));
 
 	// 规则复用 Clash 的 KV 缓存规则集,转换为 QX 语法
 	const rules = (await 获取Clash规则(env))
@@ -3681,9 +3718,10 @@ function clashRuleToLoon(r) {
 }
 
 // 本地生成完整 Loon 配置
-async function 生成本地Loon配置(节点文本, env, fileName = DEFAULT_FILE_NAME) {
+async function 生成本地Loon配置(节点文本, env, fileName = DEFAULT_FILE_NAME, FRonly = false) {
 	const lines = String(节点文本 || '').split('\n').map(s => s.trim()).filter(Boolean);
 	const proxies = [];
+	const frIndices = [];
 	const names = [];
 	for (const line of lines) {
 		let p;
@@ -3692,12 +3730,13 @@ async function 生成本地Loon配置(节点文本, env, fileName = DEFAULT_FILE
 		const pr = clashToLoonProxy(p);
 		if (!pr) continue;
 		proxies.push(pr);
+		if (!FRonly && 是否法国节点(line, null)) frIndices.push(names.length);
 		names.push(p.name || (p.server + ':' + p.port));
 	}
 	if (proxies.length === 0) return '# 无可用节点\n';
 
 	// 节点名去重(Loon 要求唯一),同步更新 [Proxy] 行;同时规避 DIRECT/REJECT 等内置保留名
-	const seenNames = new Set(['DIRECT', 'REJECT', 'PASS', 'COMPATIBLE', 'REJECT-DROP', '🎯 全球直连', '🛑 全球拦截', '🌍 国外媒体', '📲 电报信息', '💬 Ai平台', '🚀 节点选择', '♻️ 自动选择', '🐟 漏网之鱼']);
+	const seenNames = new Set(['DIRECT', 'REJECT', 'PASS', 'COMPATIBLE', 'REJECT-DROP', '🎯 全球直连', '🛑 全球拦截', '🌍 国外媒体', '📲 电报信息', '💬 Ai平台', '🚀 节点选择', '♻️ 自动选择', '🐟 漏网之鱼', '🇫🇷 法国节点']);
 	for (let i = 0; i < names.length; i++) {
 		let n = names[i];
 		let k = 2;
@@ -3720,9 +3759,11 @@ async function 生成本地Loon配置(节点文本, env, fileName = DEFAULT_FILE
 	const 自动选择 = '♻️ 自动选择';
 	const 漏网 = '🐟 漏网之鱼';
 
+	const frNames = frIndices.map(i => names[i]);
+	const 法国组 = '🇫🇷 法国节点';
 	const loonq = v => loonQuote(v);
 	const groups = [
-		节点选择 + ' = select, ' + [自动选择, ...names, 直连].map(loonq).join(', '),
+		节点选择 + ' = select, ' + [自动选择, ...names, ...(frNames.length ? [法国组] : []), 直连].map(loonq).join(', '),
 		自动选择 + ' = url-test, ' + names.map(loonq).join(', ') + ', url=http://www.gstatic.com/generate_204, interval=300, tolerance=100',
 		直连 + ' = select, DIRECT',
 		拦截 + ' = select, REJECT',
@@ -3731,6 +3772,8 @@ async function 生成本地Loon配置(节点文本, env, fileName = DEFAULT_FILE
 		Ai + ' = select, ' + [节点选择, 直连].map(loonq).join(', '),
 		漏网 + ' = select, ' + [节点选择, 直连].map(loonq).join(', '),
 	];
+	// 法国节点单立成组(FR-only 订阅模式下整份即为法国节点)
+	if (frNames.length && !FRonly) groups.push(法国组 + ' = select, ' + [...frNames, 节点选择].map(loonq).join(', '));
 
 	const rules = (await 获取Clash规则(env)).map(clashRuleToLoon);
 	if (!rules.some(r => r.startsWith('FINAL,'))) rules.push('FINAL,' + 漏网);
@@ -3775,6 +3818,13 @@ function 过滤协议节点(text, allowed) {
 // 这样不同来源订阅中“一模一样”的节点(仅名称或参数顺序不同)也能被识别为重复。
 
 function 节点去重身份(line) {
+	line = String(line || '').trim();
+	if (!line) return '';
+	// 归一化 hy2 -> hysteria2 (与 节点协议 保持一致,避免同一节点因别名被误判为不同)
+	if (line.toLowerCase().startsWith('hy2://')) line = 'hysteria2://' + line.slice(6);
+	// 协议 scheme 归一化为小写,避免大小写差异导致去重失效
+	const scIdx = line.indexOf('://');
+	if (scIdx !== -1) line = line.slice(0, scIdx).toLowerCase() + line.slice(scIdx);
 	try {
 		if (line.startsWith('vmess://')) {
 			// 解码 JSON,剔除 ps(名称)字段后按排序键重新序列化
@@ -4136,16 +4186,18 @@ function 屏蔽节点(text, 额外词 = []) {
 }
 
 // 文本去重:同一节点(忽略名称差异)仅保留第一次出现的行
+// 修复:输入行先 trim,避免前导/尾随空白导致同一节点被误判为不同节点
 function 节点去重(text) {
 	const uniqueLines = [];
 	const seen = new Set();
-	for (const line of text.split('\n')) {
-		const id = 节点去重身份(line);
+	for (const raw of text.split('\n')) {
+		const line = String(raw || '').trim();
+		const id = line ? 节点去重身份(line) : '';
 		if (!line || !id) {
-			// 空行/注释等非节点行:按原始行去重(与旧行为一致)
+			// 空行/注释等非节点行:按去空后内容去重,避免空白差异产生重复空行
 			if (seen.has('RAW:' + line)) continue;
 			seen.add('RAW:' + line);
-			uniqueLines.push(line);
+			if (line) uniqueLines.push(line);
 			continue;
 		}
 		if (seen.has(id)) continue;
@@ -4153,6 +4205,113 @@ function 节点去重(text) {
 		uniqueLines.push(line);
 	}
 	return uniqueLines.join('\n');
+}
+
+// ==================== 按名称/本地 GeoIP 识别法国节点 ====================
+// 法国节点识别复用「中国大陆 GeoIP」方案的双路逻辑:
+//   - 服务器为 IP 字面量(Worker 内可做本地 CIDR 匹配,零第三方查询):以法国 IP 段为准,更准确;
+//   - 服务器为域名(Worker 无法 DNS 解析)或未加载到法国 IP 数据:回退到名称关键词。
+// 法国 IP 数据(KV 7 天缓存 + 实例内存 1 小时缓存)来源 ipdeny 法国 CIDR 区(纯 CIDR 文本),
+// 复用现有的 CIDR 解析/合并/二分查找链,与中国 IP 逻辑完全一致,不向任何第三方查询接口请求。
+
+// 法国节点名称关键词:含法国地名/拼音/英文或法语+主要法国城市/机场名称。
+// 仅匹配名称,不作为 IP 判断依据;IP 判断靠法国 CIDR 列表(更可靠)。
+// 支持: 中文/繁体/英文/法语城区、ISO 代码 FR/FRA、旗帜 emoji、主要城市(巴黎/里昂/马赛/尼斯等)、海外省卡宴。
+// 已修正早期翻译错误: 第戎(Dijon)/戛纳(Cannes)/阿维尼翁(Avignon)/格勒诺布尔(Grenoble)/利摩日(Limoges)/兰斯(Reims)/土伦(Toulon)/布雷斯特(Brest)/敦刻尔克(Dunkirk) 等。
+const 法国地域词 = /法国|法國|法兰西|France|French|🇫🇷|\bFR\b|\bFRA\b|巴黎|Paris|里昂|Lyon|马赛|Marseille|尼斯|Nice|雷恩|Rennes|图卢兹|Toulouse|第戎|Dijon|里尔|Lille|勒阿弗尔|Le Havre|戛纳|Cannes|阿维尼翁|Avignon|波尔多|Bordeaux|南特|Nantes|斯特拉斯堡|Strasbourg|蒙彼利埃|Montpellier|南锡|Nancy|鲁昂|Rouen|土伦|Toulon|布雷斯特|Brest|格勒诺布尔|Grenoble|利摩日|Limoges|兰斯|Reims|敦刻尔克|Dunkirk|卡宴|Cayenne/i;
+
+const 法国IP源 = [
+	// ipdeny.com: 最后更新 2026-08-26 (4732 IPv4), 需同时拉取 IPv6 文件才完整; 此为法国官方地理分配,聚合度高
+	{ url: 'https://www.ipdeny.com/ipblocks/data/countries/fr.zone', name: 'ipdeny-fr-v4' },
+	{ url: 'https://www.ipdeny.com/ipv6/ipaddresses/blocks/fr.zone', name: 'ipdeny-fr-v6' },
+	// ipverse (原 ipdeny/country-ip-blocks 已迁移至 ipverse,每日从 5 大 RIR 更新,469★): 更细粒度,含 4156 IPv4 + 1394 IPv6
+	{ url: 'https://raw.githubusercontent.com/ipverse/country-ip-blocks/master/country/fr/ipv4-aggregated.txt', name: 'ipverse-fr-v4' },
+	{ url: 'https://raw.githubusercontent.com/ipverse/country-ip-blocks/master/country/fr/ipv6-aggregated.txt', name: 'ipverse-fr-v6' },
+	{ url: 'https://cdn.jsdelivr.net/gh/ipverse/country-ip-blocks@master/country/fr/ipv4-aggregated.txt', name: 'ipverse-jsdelivr-v4' },
+	{ url: 'https://cdn.jsdelivr.net/gh/ipverse/country-ip-blocks@master/country/fr/ipv6-aggregated.txt', name: 'ipverse-jsdelivr-v6' },
+];
+const 法国IP内存 = { 数据: null, 版本: '', at: 0 }; // at=0 表示从未成功加载
+const 法国IP缓存有效期 = 7 * 24 * 3600 * 1000; // 7 天
+const 法国IP重试退避 = 3600 * 1000; // 失败后 1 小时内不重复下载
+
+// 获取法国 IP 段数据:实例内存缓存(1小时) -> KV 缓存(7天) -> 退避 -> 下载 ipdeny 法区 CIDR。
+// 与获取中国IP数据 流程完全一致,复用解析中国IP文本/CIDR转区间/合并区间/区间二分查找 等通用 CIDR 链。
+async function 获取法国IP数据(env) {
+	const now = Date.now();
+	// 1) 实例内存缓存:避免每请求重新读 KV / 重新解析数万条 CIDR
+	if (法国IP内存.数据 && now - 法国IP内存.at < 3600 * 1000) return 法国IP内存;
+	// 2) KV 缓存
+	if (env && env.KV) {
+		try {
+			const raw = await env.KV.get('FR_IP.txt');
+			const at = Number(await env.KV.get('FR_IP_AT') || 0);
+			if (raw && now - at < 法国IP缓存有效期) {
+				const d = 解析中国IP文本(raw);
+				if (d) { 法国IP内存.数据 = d; 法国IP内存.版本 = String(at); 法国IP内存.at = now; return 法国IP内存; }
+			}
+		} catch (e) { /* KV 异常则走下载 */ }
+	}
+	// 3) 失败退避:1 小时内不重复尝试下载(有 KV 时以 KV 的 FR_IP_TRY 为准)
+	if (now - 法国IP内存.at < 法国IP重试退避) return 法国IP内存.数据 ? 法国IP内存 : null;
+	if (env && env.KV) {
+		try {
+			const lastTry = Number(await env.KV.get('FR_IP_TRY') || 0);
+			if (now - lastTry < 法国IP重试退避) return 法国IP内存.数据 ? 法国IP内存 : null;
+			await env.KV.put('FR_IP_TRY', String(now), { expirationTtl: 3600 });
+		} catch (e) { /* 忽略 */ }
+	}
+	// 4) 并行拉取所有源并合并(确保 v4+v6 完整覆盖,单文件仅含单栈会漏另一栈)
+	// ipdeny 的 v4 与 v6 分文件,ipverse 同理,需合并后统一解析为 {v4:[],v6:[]} 才能同时匹配两种 IP 节点
+	try {
+		const results = await Promise.allSettled(法国IP源.map(源 =>
+			fetch(源.url, { signal: AbortSignal.timeout(15000) }).then(r => r.ok ? r.text() : Promise.reject(new Error('HTTP '+r.status))).catch(() => '')
+		));
+		let 合并文本 = '';
+		for (const r of results) if (r.status === 'fulfilled' && r.value) 合并文本 += '\n' + r.value;
+		// 若全部源均失败(离线/限流),合并文本为空则解析失败
+		if (合并文本.trim()) {
+			const d = 解析中国IP文本(合并文本);
+			if (d) {
+				法国IP内存.数据 = d; 法国IP内存.版本 = String(now); 法国IP内存.at = now;
+				if (env && env.KV) {
+					try {
+						await env.KV.put('FR_IP.txt', 合并文本, { expirationTtl: 7 * 24 * 3600 });
+						await env.KV.put('FR_IP_AT', String(now), { expirationTtl: 7 * 24 * 3600 });
+					} catch (e) { /* 忽略 */ }
+				}
+				return 法国IP内存;
+			}
+		}
+	} catch (e) { /* 合并解析失败则回退 */ }
+	return 法国IP内存.数据 ? 法国IP内存 : null;
+}
+
+// 判断 IP 是否落在法国 CIDR 范围内(本质与中国 IP 二分查找同组)
+function 是法国IP(数据, ip) { return 中国IP匹配(数据, ip); }
+
+// 判断单个节点是否为法国节点:IP 优先,名称关键词回退。
+// frIpData 为空时仅走名称关键字(用于结构化配置的法国分组,零额外网络请求)。
+function 是否法国节点(line, frIpData = null) {
+	const s = String(line || '').trim();
+	if (!s) return false;
+	// 本地 GeoIP:服务器为 IP 字面量时以 IP 归属为准(名称不可靠,机场常乱起名)
+	if (frIpData) {
+		const host = 节点服务器地址(s);
+		if (host && 是IP字面量(host)) return 是法国IP(frIpData, host);
+	}
+	// 域名节点 / 未加载到 IP 数据:回退到名称关键词判断
+	const 名 = 解析节点名(s);
+	if (!名) return false;
+	return 法国地域词.test(名);
+}
+
+// 仅保留法国节点(白名单):用于 ?fr 法国专属订阅。空行/无法识别的节点被剔除。
+function 仅保留法国节点(text, frIpData = null) {
+	return String(text || '').split('\n').filter(line => {
+		const s = line.trim();
+		if (!s) return false;
+		return 是否法国节点(s, frIpData);
+	}).join('\n');
 }
 
 async function 迁移地址列表(env, txt = 'ADD.txt') {
@@ -4391,6 +4550,24 @@ async function KV(request, env, txt = 'ADD.txt', { subscriptionToken, fileName }
 					loon订阅地址:<br>
 					<a href="javascript:void(0)" onclick="copyToClipboard('https://${url.hostname}/sub?token=${subscriptionToken}&loon','qrcode_5')" style="color:blue;text-decoration:underline;cursor:pointer;">https://${url.hostname}/sub?token=${subscriptionToken}&loon</a><br>
 					<div id="qrcode_5" style="margin: 10px 10px 10px 10px;"></div>
+					&nbsp;<br>
+					<strong style="color:#c0392b">🇫🇷 法国节点订阅 (French-only) — &fr 仅保留法国节点</strong><br>
+					---------------------------------------------------------------<br>
+					自适应(Base64)法国订阅:<br>
+					<a href="javascript:void(0)" onclick="copyToClipboard('https://${url.hostname}/sub?token=${subscriptionToken}&fr','qrcode_fr0')" style="color:blue;text-decoration:underline;cursor:pointer;">https://${url.hostname}/sub?token=${subscriptionToken}&fr</a><br>
+					<div id="qrcode_fr0" style="margin: 10px 10px 10px 10px;"></div>
+					clash法国订阅:<br>
+					<a href="javascript:void(0)" onclick="copyToClipboard('https://${url.hostname}/sub?token=${subscriptionToken}&clash&fr','qrcode_fr1')" style="color:blue;text-decoration:underline;cursor:pointer;">https://${url.hostname}/sub?token=${subscriptionToken}&clash&fr</a><br>
+					<div id="qrcode_fr1" style="margin: 10px 10px 10px 10px;"></div>
+					singbox法国订阅:<br>
+					<a href="javascript:void(0)" onclick="copyToClipboard('https://${url.hostname}/sub?token=${subscriptionToken}&sb&fr','qrcode_fr2')" style="color:blue;text-decoration:underline;cursor:pointer;">https://${url.hostname}/sub?token=${subscriptionToken}&sb&fr</a><br>
+					<div id="qrcode_fr2" style="margin: 10px 10px 10px 10px;"></div>
+					surge法国订阅:<br>
+					<a href="javascript:void(0)" onclick="copyToClipboard('https://${url.hostname}/sub?token=${subscriptionToken}&surge&fr','qrcode_fr3')" style="color:blue;text-decoration:underline;cursor:pointer;">https://${url.hostname}/sub?token=${subscriptionToken}&surge&fr</a><br>
+					<div id="qrcode_fr3" style="margin: 10px 10px 10px 10px;"></div>
+					loon法国订阅:<br>
+					<a href="javascript:void(0)" onclick="copyToClipboard('https://${url.hostname}/sub?token=${subscriptionToken}&loon&fr','qrcode_fr4')" style="color:blue;text-decoration:underline;cursor:pointer;">https://${url.hostname}/sub?token=${subscriptionToken}&loon&fr</a><br>
+					<div id="qrcode_fr4" style="margin: 10px 10px 10px 10px;"></div>
 					&nbsp;&nbsp;<strong><a href="javascript:void(0);" id="noticeToggle" onclick="toggleNotice()">查看访客订阅∨</a></strong><br>
 					<div id="noticeContent" class="notice-content" style="display: none;">
 						---------------------------------------------------------------<br>
@@ -4415,6 +4592,24 @@ async function KV(request, env, txt = 'ADD.txt', { subscriptionToken, fileName }
 						loon订阅地址:<br>
 						<a href="javascript:void(0)" onclick="copyToClipboard('https://${url.hostname}/sub?token=${subscriptionToken}&loon','guest_5')" style="color:blue;text-decoration:underline;cursor:pointer;">https://${url.hostname}/sub?token=${subscriptionToken}&loon</a><br>
 						<div id="guest_5" style="margin: 10px 10px 10px 10px;"></div>
+						&nbsp;<br>
+						<strong style="color:#c0392b">🇫🇷 法国节点订阅 (French-only)</strong><br>
+						---------------------------------------------------------------<br>
+						自适应(Base64)法国订阅地址:<br>
+						<a href="javascript:void(0)" onclick="copyToClipboard('https://${url.hostname}/sub?token=${subscriptionToken}&fr','guest_fr0')" style="color:blue;text-decoration:underline;cursor:pointer;">https://${url.hostname}/sub?token=${subscriptionToken}&fr</a><br>
+						<div id="guest_fr0" style="margin: 10px 10px 10px 10px;"></div>
+						clash法国订阅地址:<br>
+						<a href="javascript:void(0)" onclick="copyToClipboard('https://${url.hostname}/sub?token=${subscriptionToken}&clash&fr','guest_fr1')" style="color:blue;text-decoration:underline;cursor:pointer;">https://${url.hostname}/sub?token=${subscriptionToken}&clash&fr</a><br>
+						<div id="guest_fr1" style="margin: 10px 10px 10px 10px;"></div>
+						singbox法国订阅地址:<br>
+						<a href="javascript:void(0)" onclick="copyToClipboard('https://${url.hostname}/sub?token=${subscriptionToken}&sb&fr','guest_fr2')" style="color:blue;text-decoration:underline;cursor:pointer;">https://${url.hostname}/sub?token=${subscriptionToken}&sb&fr</a><br>
+						<div id="guest_fr2" style="margin: 10px 10px 10px 10px;"></div>
+						surge法国订阅地址:<br>
+						<a href="javascript:void(0)" onclick="copyToClipboard('https://${url.hostname}/sub?token=${subscriptionToken}&surge&fr','guest_fr3')" style="color:blue;text-decoration:underline;cursor:pointer;">https://${url.hostname}/sub?token=${subscriptionToken}&surge&fr</a><br>
+						<div id="guest_fr3" style="margin: 10px 10px 10px 10px;"></div>
+						loon法国订阅地址:<br>
+						<a href="javascript:void(0)" onclick="copyToClipboard('https://${url.hostname}/sub?token=${subscriptionToken}&loon&fr','guest_fr4')" style="color:blue;text-decoration:underline;cursor:pointer;">https://${url.hostname}/sub?token=${subscriptionToken}&loon&fr</a><br>
+						<div id="guest_fr4" style="margin: 10px 10px 10px 10px;"></div>
 					</div>
 					---------------------------------------------------------------<br>
 					################################################################<br>

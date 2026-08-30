@@ -31,7 +31,7 @@ const tmpWorker = path.join('/tmp', `_worker_unit_${process.pid}.cjs`);
 fs.writeFileSync(
 	tmpWorker,
 	workerSrc +
-		'\nmodule.exports.__test = { hashText, 本地解析订阅内容, 节点去重, 节点协议, 过滤协议节点, 解析节点名, 剔除大陆节点, 屏蔽节点, 是本地服务器地址, parseYamlValue, base64Decode, proxyURL, 生成本地Clash配置, 生成本地Singbox配置, 生成本地Surge配置, 生成本地Quanx配置, 生成本地Loon配置, singboxJSONtoURIs, 迁移地址列表, KV, getSUB, 解析中国IP文本, 中国IP匹配, 节点服务器地址, 清空实例缓存: () => { 内存缓存.clear(); 热点缓存.clear(); SWR调度记录.clear(); 迁移已执行 = false; } };\n'
+		'\nmodule.exports.__test = { hashText, 本地解析订阅内容, 节点去重, 节点协议, 过滤协议节点, 解析节点名, 剔除大陆节点, 屏蔽节点, 是本地服务器地址, parseYamlValue, base64Decode, proxyURL, 生成本地Clash配置, 生成本地Singbox配置, 生成本地Surge配置, 生成本地Quanx配置, 生成本地Loon配置, singboxJSONtoURIs, 迁移地址列表, KV, getSUB, 解析中国IP文本, 中国IP匹配, 节点服务器地址, 仅保留法国节点, 是否法国节点, 清空实例缓存: () => { 内存缓存.clear(); 热点缓存.clear(); SWR调度记录.clear(); 迁移已执行 = false; } };\n'
 );
 const mod = await import(pathToFileURL(tmpWorker).href);
 const {
@@ -59,6 +59,8 @@ const {
 	解析中国IP文本,
 	中国IP匹配,
 	节点服务器地址,
+	仅保留法国节点,
+	是否法国节点,
 	清空实例缓存,
 } = mod.default.__test;
 const worker = mod.default;
@@ -927,6 +929,32 @@ await t('是本地服务器地址: 回环/全零/域名判定,普通 IP 排除',
 	assert.ok(!是本地服务器地址('2001:db8::1'));
 });
 
+await t('仅保留法国节点: 关键词白名单仅保留法国节点,剔除非法国节点', async () => {
+	const fr = 'vless://00000000-0000-0000-0000-000000000000@1.2.3.4:443?type=tcp#法国-巴黎';
+	const fr2 = 'vless://00000000-0000-0000-0000-000000000000@5.6.7.8:443?type=tcp#France';
+	const hk = 'vless://00000000-0000-0000-0000-000000000000@8.8.8.8:443?type=tcp#香港-01';
+	const jp = 'vless://00000000-0000-0000-0000-000000000000@9.9.9.9:443?type=tcp#Tokyo-01';
+	const text = [fr, fr2, hk, jp].join('\n');
+	const out = 仅保留法国节点(text, null); // frIpData=null -> 仅走名称关键词(零第三方查询)
+	const lines = out.split('\n').filter(l => l.trim());
+	assert.ok(lines.length === 2, '应仅保留 2 个法国节点');
+	assert.ok(lines.every(l => 是否法国节点(l, null)), '保留的节点均应判定为法国节点');
+	assert.ok(!out.includes('香港'), '香港节点应被剔除');
+	assert.ok(!out.includes('Tokyo-01'), '东京节点应被剔除');
+});
+
+await t('生成本地Clash配置: 法国节点存在时建🇫🇷法国节点分组,FR-only/SR-only 情况不建', async () => {
+	const fr = 'vless://00000000-0000-0000-0000-000000000000@1.2.3.4:443?type=tcp#法国-巴黎';
+	const hk = 'vless://00000000-0000-0000-0000-000000000000@8.8.8.8:443?type=tcp#香港-01';
+	const nodes = [fr, hk].join('\n');
+	const cfg = await 生成本地Clash配置(nodes, {}, 'UnitTest', false);
+	assert.ok(cfg.includes('🇫🇷 法国节点'), '含法国节点时应生成法国专属策略组');
+	assert.ok(cfg.includes('proxy-groups:'), '应包含 proxy-groups');
+	const cfgFR = await 生成本地Clash配置(nodes, {}, 'UnitTest', true);
+	assert.ok(!cfgFR.includes('🇫🇷 法国节点'), 'FR-only(整份即为法国节点)不应额外建法国分组');
+	const noFr = await 生成本地Clash配置(hk, {}, 'UnitTest', false);
+	assert.ok(!noFr.includes('🇫🇷 法国节点'), '无法国节点时不应建法国分组');
+});
 // ---- 输出汇总 ----
 console.log(`[unit] 通过 ${passed} / ${results.length}`);
 for (const r of results) console.log(r);

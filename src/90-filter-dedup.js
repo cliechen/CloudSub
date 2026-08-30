@@ -25,6 +25,13 @@ function 过滤协议节点(text, allowed) {
 // 这样不同来源订阅中“一模一样”的节点(仅名称或参数顺序不同)也能被识别为重复。
 
 function 节点去重身份(line) {
+	line = String(line || '').trim();
+	if (!line) return '';
+	// 归一化 hy2 -> hysteria2 (与 节点协议 保持一致,避免同一节点因别名被误判为不同)
+	if (line.toLowerCase().startsWith('hy2://')) line = 'hysteria2://' + line.slice(6);
+	// 协议 scheme 归一化为小写,避免大小写差异导致去重失效
+	const scIdx = line.indexOf('://');
+	if (scIdx !== -1) line = line.slice(0, scIdx).toLowerCase() + line.slice(scIdx);
 	try {
 		if (line.startsWith('vmess://')) {
 			// 解码 JSON,剔除 ps(名称)字段后按排序键重新序列化
@@ -386,16 +393,18 @@ function 屏蔽节点(text, 额外词 = []) {
 }
 
 // 文本去重:同一节点(忽略名称差异)仅保留第一次出现的行
+// 修复:输入行先 trim,避免前导/尾随空白导致同一节点被误判为不同节点
 function 节点去重(text) {
 	const uniqueLines = [];
 	const seen = new Set();
-	for (const line of text.split('\n')) {
-		const id = 节点去重身份(line);
+	for (const raw of text.split('\n')) {
+		const line = String(raw || '').trim();
+		const id = line ? 节点去重身份(line) : '';
 		if (!line || !id) {
-			// 空行/注释等非节点行:按原始行去重(与旧行为一致)
+			// 空行/注释等非节点行:按去空后内容去重,避免空白差异产生重复空行
 			if (seen.has('RAW:' + line)) continue;
 			seen.add('RAW:' + line);
-			uniqueLines.push(line);
+			if (line) uniqueLines.push(line);
 			continue;
 		}
 		if (seen.has(id)) continue;
@@ -403,5 +412,112 @@ function 节点去重(text) {
 		uniqueLines.push(line);
 	}
 	return uniqueLines.join('\n');
+}
+
+// ==================== 按名称/本地 GeoIP 识别法国节点 ====================
+// 法国节点识别复用「中国大陆 GeoIP」方案的双路逻辑:
+//   - 服务器为 IP 字面量(Worker 内可做本地 CIDR 匹配,零第三方查询):以法国 IP 段为准,更准确;
+//   - 服务器为域名(Worker 无法 DNS 解析)或未加载到法国 IP 数据:回退到名称关键词。
+// 法国 IP 数据(KV 7 天缓存 + 实例内存 1 小时缓存)来源 ipdeny 法国 CIDR 区(纯 CIDR 文本),
+// 复用现有的 CIDR 解析/合并/二分查找链,与中国 IP 逻辑完全一致,不向任何第三方查询接口请求。
+
+// 法国节点名称关键词:含法国地名/拼音/英文或法语+主要法国城市/机场名称。
+// 仅匹配名称,不作为 IP 判断依据;IP 判断靠法国 CIDR 列表(更可靠)。
+// 支持: 中文/繁体/英文/法语城区、ISO 代码 FR/FRA、旗帜 emoji、主要城市(巴黎/里昂/马赛/尼斯等)、海外省卡宴。
+// 已修正早期翻译错误: 第戎(Dijon)/戛纳(Cannes)/阿维尼翁(Avignon)/格勒诺布尔(Grenoble)/利摩日(Limoges)/兰斯(Reims)/土伦(Toulon)/布雷斯特(Brest)/敦刻尔克(Dunkirk) 等。
+const 法国地域词 = /法国|法國|法兰西|France|French|🇫🇷|\bFR\b|\bFRA\b|巴黎|Paris|里昂|Lyon|马赛|Marseille|尼斯|Nice|雷恩|Rennes|图卢兹|Toulouse|第戎|Dijon|里尔|Lille|勒阿弗尔|Le Havre|戛纳|Cannes|阿维尼翁|Avignon|波尔多|Bordeaux|南特|Nantes|斯特拉斯堡|Strasbourg|蒙彼利埃|Montpellier|南锡|Nancy|鲁昂|Rouen|土伦|Toulon|布雷斯特|Brest|格勒诺布尔|Grenoble|利摩日|Limoges|兰斯|Reims|敦刻尔克|Dunkirk|卡宴|Cayenne/i;
+
+const 法国IP源 = [
+	// ipdeny.com: 最后更新 2026-08-26 (4732 IPv4), 需同时拉取 IPv6 文件才完整; 此为法国官方地理分配,聚合度高
+	{ url: 'https://www.ipdeny.com/ipblocks/data/countries/fr.zone', name: 'ipdeny-fr-v4' },
+	{ url: 'https://www.ipdeny.com/ipv6/ipaddresses/blocks/fr.zone', name: 'ipdeny-fr-v6' },
+	// ipverse (原 ipdeny/country-ip-blocks 已迁移至 ipverse,每日从 5 大 RIR 更新,469★): 更细粒度,含 4156 IPv4 + 1394 IPv6
+	{ url: 'https://raw.githubusercontent.com/ipverse/country-ip-blocks/master/country/fr/ipv4-aggregated.txt', name: 'ipverse-fr-v4' },
+	{ url: 'https://raw.githubusercontent.com/ipverse/country-ip-blocks/master/country/fr/ipv6-aggregated.txt', name: 'ipverse-fr-v6' },
+	{ url: 'https://cdn.jsdelivr.net/gh/ipverse/country-ip-blocks@master/country/fr/ipv4-aggregated.txt', name: 'ipverse-jsdelivr-v4' },
+	{ url: 'https://cdn.jsdelivr.net/gh/ipverse/country-ip-blocks@master/country/fr/ipv6-aggregated.txt', name: 'ipverse-jsdelivr-v6' },
+];
+const 法国IP内存 = { 数据: null, 版本: '', at: 0 }; // at=0 表示从未成功加载
+const 法国IP缓存有效期 = 7 * 24 * 3600 * 1000; // 7 天
+const 法国IP重试退避 = 3600 * 1000; // 失败后 1 小时内不重复下载
+
+// 获取法国 IP 段数据:实例内存缓存(1小时) -> KV 缓存(7天) -> 退避 -> 下载 ipdeny 法区 CIDR。
+// 与获取中国IP数据 流程完全一致,复用解析中国IP文本/CIDR转区间/合并区间/区间二分查找 等通用 CIDR 链。
+async function 获取法国IP数据(env) {
+	const now = Date.now();
+	// 1) 实例内存缓存:避免每请求重新读 KV / 重新解析数万条 CIDR
+	if (法国IP内存.数据 && now - 法国IP内存.at < 3600 * 1000) return 法国IP内存;
+	// 2) KV 缓存
+	if (env && env.KV) {
+		try {
+			const raw = await env.KV.get('FR_IP.txt');
+			const at = Number(await env.KV.get('FR_IP_AT') || 0);
+			if (raw && now - at < 法国IP缓存有效期) {
+				const d = 解析中国IP文本(raw);
+				if (d) { 法国IP内存.数据 = d; 法国IP内存.版本 = String(at); 法国IP内存.at = now; return 法国IP内存; }
+			}
+		} catch (e) { /* KV 异常则走下载 */ }
+	}
+	// 3) 失败退避:1 小时内不重复尝试下载(有 KV 时以 KV 的 FR_IP_TRY 为准)
+	if (now - 法国IP内存.at < 法国IP重试退避) return 法国IP内存.数据 ? 法国IP内存 : null;
+	if (env && env.KV) {
+		try {
+			const lastTry = Number(await env.KV.get('FR_IP_TRY') || 0);
+			if (now - lastTry < 法国IP重试退避) return 法国IP内存.数据 ? 法国IP内存 : null;
+			await env.KV.put('FR_IP_TRY', String(now), { expirationTtl: 3600 });
+		} catch (e) { /* 忽略 */ }
+	}
+	// 4) 并行拉取所有源并合并(确保 v4+v6 完整覆盖,单文件仅含单栈会漏另一栈)
+	// ipdeny 的 v4 与 v6 分文件,ipverse 同理,需合并后统一解析为 {v4:[],v6:[]} 才能同时匹配两种 IP 节点
+	try {
+		const results = await Promise.allSettled(法国IP源.map(源 =>
+			fetch(源.url, { signal: AbortSignal.timeout(15000) }).then(r => r.ok ? r.text() : Promise.reject(new Error('HTTP '+r.status))).catch(() => '')
+		));
+		let 合并文本 = '';
+		for (const r of results) if (r.status === 'fulfilled' && r.value) 合并文本 += '\n' + r.value;
+		// 若全部源均失败(离线/限流),合并文本为空则解析失败
+		if (合并文本.trim()) {
+			const d = 解析中国IP文本(合并文本);
+			if (d) {
+				法国IP内存.数据 = d; 法国IP内存.版本 = String(now); 法国IP内存.at = now;
+				if (env && env.KV) {
+					try {
+						await env.KV.put('FR_IP.txt', 合并文本, { expirationTtl: 7 * 24 * 3600 });
+						await env.KV.put('FR_IP_AT', String(now), { expirationTtl: 7 * 24 * 3600 });
+					} catch (e) { /* 忽略 */ }
+				}
+				return 法国IP内存;
+			}
+		}
+	} catch (e) { /* 合并解析失败则回退 */ }
+	return 法国IP内存.数据 ? 法国IP内存 : null;
+}
+
+// 判断 IP 是否落在法国 CIDR 范围内(本质与中国 IP 二分查找同组)
+function 是法国IP(数据, ip) { return 中国IP匹配(数据, ip); }
+
+// 判断单个节点是否为法国节点:IP 优先,名称关键词回退。
+// frIpData 为空时仅走名称关键字(用于结构化配置的法国分组,零额外网络请求)。
+function 是否法国节点(line, frIpData = null) {
+	const s = String(line || '').trim();
+	if (!s) return false;
+	// 本地 GeoIP:服务器为 IP 字面量时以 IP 归属为准(名称不可靠,机场常乱起名)
+	if (frIpData) {
+		const host = 节点服务器地址(s);
+		if (host && 是IP字面量(host)) return 是法国IP(frIpData, host);
+	}
+	// 域名节点 / 未加载到 IP 数据:回退到名称关键词判断
+	const 名 = 解析节点名(s);
+	if (!名) return false;
+	return 法国地域词.test(名);
+}
+
+// 仅保留法国节点(白名单):用于 ?fr 法国专属订阅。空行/无法识别的节点被剔除。
+function 仅保留法国节点(text, frIpData = null) {
+	return String(text || '').split('\n').filter(line => {
+		const s = line.trim();
+		if (!s) return false;
+		return 是否法国节点(s, frIpData);
+	}).join('\n');
 }
 

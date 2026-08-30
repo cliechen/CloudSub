@@ -245,21 +245,27 @@ function 校验节点(p) {
 }
 
 // 本地生成完整 sing-box JSON 配置
-async function 生成本地Singbox配置(节点文本, env, fileName = DEFAULT_FILE_NAME) {
+async function 生成本地Singbox配置(节点文本, env, fileName = DEFAULT_FILE_NAME, FRonly = false) {
 	const lines = String(节点文本 || '').split('\n').map(s => s.trim()).filter(Boolean);
 	const outbounds = [];
 	const endpoints = [];
+	const frOutIndices = [];
+	const frEpIndices = [];
 	for (const line of lines) {
 		let p;
 		try { p = uriToClashProxy(line); } catch (e) { p = null; } // 单节点解析失败只跳过该节点
 		if (!p || !校验节点(p)) continue; // 协议级校验:不合格节点宁缺毋滥
 		if (p.type === 'wireguard') {
 			const ep = clashToSingboxEndpoint(p);
-			if (ep) endpoints.push(ep);
+			if (!ep) continue;
+			if (!FRonly && 是否法国节点(line, null)) frEpIndices.push(endpoints.length);
+			endpoints.push(ep);
 			continue;
 		}
 		const o = clashToSingboxOutbound(p);
-		if (o) outbounds.push(o);
+		if (!o) continue;
+		if (!FRonly && 是否法国节点(line, null)) frOutIndices.push(outbounds.length);
+		outbounds.push(o);
 	}
 	if (outbounds.length === 0 && endpoints.length === 0) return JSON.stringify({ log: { level: 'info' }, outbounds: [] });
 
@@ -274,6 +280,7 @@ async function 生成本地Singbox配置(节点文本, env, fileName = DEFAULT_F
 		o.tag = t;
 	}
 	const nodeTags = allNodes.map(o => o.tag);
+	const frNames = [...frOutIndices.map(i => allNodes[i].tag), ...frEpIndices.map(i => allNodes[outbounds.length + i].tag)];
 
 	const 直连 = '🎯 全球直连';
 	const 拦截 = '🛑 全球拦截';
@@ -284,8 +291,9 @@ async function 生成本地Singbox配置(节点文本, env, fileName = DEFAULT_F
 	const 自动选择 = '♻️ 自动选择';
 	const 漏网 = '🐟 漏网之鱼';
 
+	const 法国组 = '🇫🇷 法国节点';
 	const groups = [
-		{ type: 'selector', tag: 节点选择, outbounds: [自动选择, ...nodeTags, 直连] },
+		{ type: 'selector', tag: 节点选择, outbounds: [自动选择, ...nodeTags, ...(frNames.length ? [法国组] : []), 直连] },
 		{ type: 'urltest', tag: 自动选择, outbounds: nodeTags, url: 'http://www.gstatic.com/generate_204', interval: '300s' },
 		{ type: 'direct', tag: 直连 },
 		{ type: 'block', tag: 拦截 },
@@ -294,6 +302,8 @@ async function 生成本地Singbox配置(节点文本, env, fileName = DEFAULT_F
 		{ type: 'selector', tag: Ai, outbounds: [节点选择, 直连] },
 		{ type: 'selector', tag: 漏网, outbounds: [节点选择, 直连] },
 	];
+	// 法国节点单独成组(FR-only 订阅模式下整份即为法国节点,无需再建分组)
+	if (frNames.length && !FRonly) groups.push({ type: 'selector', tag: 法国组, outbounds: [...frNames, 节点选择] });
 	outbounds.push(...groups);
 
 	const config = {

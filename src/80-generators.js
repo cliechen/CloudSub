@@ -1,11 +1,15 @@
 // ===== 本地生成完整 Clash YAML =====
-async function 生成本地Clash配置(节点文本, env, fileName = DEFAULT_FILE_NAME) {
+async function 生成本地Clash配置(节点文本, env, fileName = DEFAULT_FILE_NAME, FRonly = false) {
 	const lines = String(节点文本 || '').split('\n').map(s => s.trim()).filter(Boolean);
 	const proxies = [];
+	const frIndices = [];
 	for (const line of lines) {
 		let p;
 		try { p = uriToClashProxy(line); } catch (e) { p = null; } // 单节点解析失败只跳过该节点
-		if (p && 校验节点(p)) proxies.push(p); // 协议级校验:不合格节点宁缺毋滥
+		if (p && 校验节点(p)) { // 校验合法才收入
+			if (!FRonly && 是否法国节点(line, null)) frIndices.push(proxies.length);
+			proxies.push(p);
+		}
 	}
 	if (proxies.length === 0) return '# 无可用节点\n';
 
@@ -20,7 +24,8 @@ async function 生成本地Clash配置(节点文本, env, fileName = DEFAULT_FIL
 	const 节点选择 = '🚀 节点选择';
 	const 自动选择 = '♻️ 自动选择';
 	const 漏网 = '🐟 漏网之鱼';
-	const seenNames = new Set(['DIRECT', 'REJECT', 'PASS', 'COMPATIBLE', 'REJECT-DROP', 直连, 拦截, 媒体, 电报, Ai, 节点选择, 自动选择, 漏网]);
+	const 法国组 = '🇫🇷 法国节点';
+	const seenNames = new Set(['DIRECT', 'REJECT', 'PASS', 'COMPATIBLE', 'REJECT-DROP', 直连, 拦截, 媒体, 电报, Ai, 节点选择, 自动选择, 漏网, 法国组]);
 	for (const p of proxies) {
 		let n = p.name;
 		let i = 2;
@@ -29,9 +34,10 @@ async function 生成本地Clash配置(节点文本, env, fileName = DEFAULT_FIL
 		p.name = n;
 	}
 	const nodeNames = proxies.map(p => p.name);
+	const frNames = frIndices.map(i => proxies[i].name);
 
 	const groups = [
-		{ name: 节点选择, type: 'select', proxies: [自动选择, ...nodeNames, 直连] },
+		{ name: 节点选择, type: 'select', proxies: [自动选择, ...nodeNames, ...(frNames.length ? [法国组] : []), 直连] },
 		{ name: 自动选择, type: 'url-test', url: 'http://www.gstatic.com/generate_204', interval: 300, tolerance: 50, proxies: nodeNames },
 		{ name: 直连, type: 'select', proxies: ['DIRECT'] },
 		{ name: 拦截, type: 'select', proxies: ['REJECT', 'DIRECT'] },
@@ -40,6 +46,8 @@ async function 生成本地Clash配置(节点文本, env, fileName = DEFAULT_FIL
 		{ name: Ai, type: 'select', proxies: [节点选择, 直连] },
 		{ name: 漏网, type: 'select', proxies: [节点选择, 直连] },
 	];
+	// 法国节点单独成组(FR-only 订阅模式下整份即为法国节点,无需再建分组)
+	if (frNames.length && !FRonly) groups.push({ name: 法国组, type: 'select', proxies: [...frNames, 节点选择] });
 
 	const rules = await 获取Clash规则(env);
 
@@ -193,11 +201,12 @@ function clashToSurgeProxy(p, wgIndex) {
 }
 
 // 本地生成完整 Surge 配置文本
-async function 生成本地Surge配置(节点文本, env, fileName = DEFAULT_FILE_NAME, 订阅地址 = '') {
+async function 生成本地Surge配置(节点文本, env, fileName = DEFAULT_FILE_NAME, 订阅地址 = '', FRonly = false) {
 	const lines = String(节点文本 || '').split('\n').map(s => s.trim()).filter(Boolean);
 	const proxyLines = [];
 	const wgSections = [];
 	const names = [];
+	const frIndices = [];
 	let wgIndex = 0;
 	for (const line of lines) {
 		let p;
@@ -207,12 +216,13 @@ async function 生成本地Surge配置(节点文本, env, fileName = DEFAULT_FIL
 		if (!r) continue;
 		if (r.wgSection) { wgSections.push(r.wgSection); wgIndex++; }
 		proxyLines.push(r.line);
+		if (!FRonly && 是否法国节点(line, null)) frIndices.push(names.length);
 		names.push(r.name);
 	}
 	if (proxyLines.length === 0) return '# 无可用节点\n';
 
 	// 节点名去重(Surge 要求唯一),同步更新对应的 [Proxy] 行;同时规避 DIRECT/REJECT 等内置保留名
-	const seenNames = new Set(['DIRECT', 'REJECT', 'PASS', 'COMPATIBLE', 'REJECT-DROP', '🎯 全球直连', '🛑 全球拦截', '🌍 国外媒体', '📲 电报信息', '💬 Ai平台', '🚀 节点选择', '♻️ 自动选择', '🐟 漏网之鱼']);
+	const seenNames = new Set(['DIRECT', 'REJECT', 'PASS', 'COMPATIBLE', 'REJECT-DROP', '🎯 全球直连', '🛑 全球拦截', '🌍 国外媒体', '📲 电报信息', '💬 Ai平台', '🚀 节点选择', '♻️ 自动选择', '🐟 漏网之鱼', '🇫🇷 法国节点']);
 	for (let i = 0; i < names.length; i++) {
 		let n = names[i];
 		let k = 2;
@@ -234,10 +244,12 @@ async function 生成本地Surge配置(节点文本, env, fileName = DEFAULT_FIL
 	const 节点选择 = '🚀 节点选择';
 	const 自动选择 = '♻️ 自动选择';
 	const 漏网 = '🐟 漏网之鱼';
+	const frNames = frIndices.map(i => names[i]);
+	const 法国组 = '🇫🇷 法国节点';
 	const q = v => surgeQuote(v);
 
 	const groups = [
-		节点选择 + ' = select, ' + [自动选择, ...names, 直连].map(q).join(', '),
+		节点选择 + ' = select, ' + [自动选择, ...names, ...(frNames.length ? [法国组] : []), 直连].map(q).join(', '),
 		自动选择 + ' = url-test, ' + names.map(q).join(', ') + ', url=http://www.gstatic.com/generate_204, interval=300, tolerance=100',
 		直连 + ' = select, DIRECT',
 		拦截 + ' = select, REJECT',
@@ -246,6 +258,8 @@ async function 生成本地Surge配置(节点文本, env, fileName = DEFAULT_FIL
 		Ai + ' = select, ' + [节点选择, 直连].map(q).join(', '),
 		漏网 + ' = select, ' + [节点选择, 直连].map(q).join(', '),
 	];
+	// 法国节点单独成组(FR-only 订阅模式下整份即为法国节点)
+	if (frNames.length && !FRonly) groups.push(法国组 + ' = select, ' + [...frNames, 节点选择].map(q).join(', '));
 
 	// 规则复用 Clash 的 KV 缓存规则集,只需把结尾的 MATCH 换成 Surge 的 FINAL
 	const rules = (await 获取Clash规则(env)).map(r => r.startsWith('MATCH,') ? 'FINAL,' + r.slice(6) : r);
@@ -407,10 +421,11 @@ function clashRuleToQuanx(r) {
 }
 
 // 本地生成完整 Quantumult X 配置
-async function 生成本地Quanx配置(节点文本, env, fileName = DEFAULT_FILE_NAME) {
+async function 生成本地Quanx配置(节点文本, env, fileName = DEFAULT_FILE_NAME, FRonly = false) {
 	const lines = String(节点文本 || '').split('\n').map(s => s.trim()).filter(Boolean);
 	const servers = [];
 	const names = [];
+	const frIndices = [];
 	for (const line of lines) {
 		let p;
 		try { p = uriToClashProxy(line); } catch (e) { p = null; } // 单节点解析失败只跳过该节点
@@ -418,12 +433,13 @@ async function 生成本地Quanx配置(节点文本, env, fileName = DEFAULT_FIL
 		const s = clashToQuanxServer(p);
 		if (!s) continue;
 		servers.push(s);
+		if (!FRonly && 是否法国节点(line, null)) frIndices.push(names.length);
 		names.push(p.name || (p.server + ':' + p.port));
 	}
 	if (servers.length === 0) return '# 无可用节点\n';
 
 	// 节点名去重(QX 的 tag 需唯一);同时规避内置保留名
-	const seenNames = new Set(['DIRECT', 'REJECT', 'PASS', 'COMPATIBLE', 'REJECT-DROP', 'direct', 'reject', 'proxy', '🎯 全球直连', '🛑 全球拦截', '🌍 国外媒体', '📲 电报信息', '💬 Ai平台', '🚀 节点选择', '♻️ 自动选择', '🐟 漏网之鱼']);
+	const seenNames = new Set(['DIRECT', 'REJECT', 'PASS', 'COMPATIBLE', 'REJECT-DROP', 'direct', 'reject', 'proxy', '🎯 全球直连', '🛑 全球拦截', '🌍 国外媒体', '📲 电报信息', '💬 Ai平台', '🚀 节点选择', '♻️ 自动选择', '🐟 漏网之鱼', '🇫🇷 法国节点']);
 	for (let i = 0; i < names.length; i++) {
 		let n = names[i];
 		let k = 2;
@@ -443,9 +459,11 @@ async function 生成本地Quanx配置(节点文本, env, fileName = DEFAULT_FIL
 	const 自动选择 = '♻️ 自动选择';
 	const 漏网 = '🐟 漏网之鱼';
 
+	const frNames = frIndices.map(i => names[i]);
+	const 法国组 = '🇫🇷 法国节点';
 	const qxq = v => qxQuote(v);
 	const policies = [
-		'static=' + 节点选择 + ', ' + [自动选择, ...names, 直连].map(qxq).join(', '),
+		'static=' + 节点选择 + ', ' + [自动选择, ...names, ...(frNames.length ? [法国组] : []), 直连].map(qxq).join(', '),
 		'url-latency-benchmark=' + 自动选择 + ', ' + names.map(qxq).join(', ') + ', check-interval=300, alive-checking=true, tolerance=0',
 		'static=' + 直连 + ', direct',
 		'static=' + 拦截 + ', reject',
@@ -454,6 +472,8 @@ async function 生成本地Quanx配置(节点文本, env, fileName = DEFAULT_FIL
 		'static=' + Ai + ', ' + [节点选择, 直连].map(qxq).join(', '),
 		'static=' + 漏网 + ', ' + [节点选择, 直连].map(qxq).join(', '),
 	];
+	// 法国节点单独成组(FR-only 订阅模式下整份即为法国节点)
+	if (frNames.length && !FRonly) policies.push('static=' + 法国组 + ', ' + [...frNames, 节点选择].map(qxq).join(', '));
 
 	// 规则复用 Clash 的 KV 缓存规则集,转换为 QX 语法
 	const rules = (await 获取Clash规则(env))
@@ -611,9 +631,10 @@ function clashRuleToLoon(r) {
 }
 
 // 本地生成完整 Loon 配置
-async function 生成本地Loon配置(节点文本, env, fileName = DEFAULT_FILE_NAME) {
+async function 生成本地Loon配置(节点文本, env, fileName = DEFAULT_FILE_NAME, FRonly = false) {
 	const lines = String(节点文本 || '').split('\n').map(s => s.trim()).filter(Boolean);
 	const proxies = [];
+	const frIndices = [];
 	const names = [];
 	for (const line of lines) {
 		let p;
@@ -622,12 +643,13 @@ async function 生成本地Loon配置(节点文本, env, fileName = DEFAULT_FILE
 		const pr = clashToLoonProxy(p);
 		if (!pr) continue;
 		proxies.push(pr);
+		if (!FRonly && 是否法国节点(line, null)) frIndices.push(names.length);
 		names.push(p.name || (p.server + ':' + p.port));
 	}
 	if (proxies.length === 0) return '# 无可用节点\n';
 
 	// 节点名去重(Loon 要求唯一),同步更新 [Proxy] 行;同时规避 DIRECT/REJECT 等内置保留名
-	const seenNames = new Set(['DIRECT', 'REJECT', 'PASS', 'COMPATIBLE', 'REJECT-DROP', '🎯 全球直连', '🛑 全球拦截', '🌍 国外媒体', '📲 电报信息', '💬 Ai平台', '🚀 节点选择', '♻️ 自动选择', '🐟 漏网之鱼']);
+	const seenNames = new Set(['DIRECT', 'REJECT', 'PASS', 'COMPATIBLE', 'REJECT-DROP', '🎯 全球直连', '🛑 全球拦截', '🌍 国外媒体', '📲 电报信息', '💬 Ai平台', '🚀 节点选择', '♻️ 自动选择', '🐟 漏网之鱼', '🇫🇷 法国节点']);
 	for (let i = 0; i < names.length; i++) {
 		let n = names[i];
 		let k = 2;
@@ -650,9 +672,11 @@ async function 生成本地Loon配置(节点文本, env, fileName = DEFAULT_FILE
 	const 自动选择 = '♻️ 自动选择';
 	const 漏网 = '🐟 漏网之鱼';
 
+	const frNames = frIndices.map(i => names[i]);
+	const 法国组 = '🇫🇷 法国节点';
 	const loonq = v => loonQuote(v);
 	const groups = [
-		节点选择 + ' = select, ' + [自动选择, ...names, 直连].map(loonq).join(', '),
+		节点选择 + ' = select, ' + [自动选择, ...names, ...(frNames.length ? [法国组] : []), 直连].map(loonq).join(', '),
 		自动选择 + ' = url-test, ' + names.map(loonq).join(', ') + ', url=http://www.gstatic.com/generate_204, interval=300, tolerance=100',
 		直连 + ' = select, DIRECT',
 		拦截 + ' = select, REJECT',
@@ -661,6 +685,8 @@ async function 生成本地Loon配置(节点文本, env, fileName = DEFAULT_FILE
 		Ai + ' = select, ' + [节点选择, 直连].map(loonq).join(', '),
 		漏网 + ' = select, ' + [节点选择, 直连].map(loonq).join(', '),
 	];
+	// 法国节点单立成组(FR-only 订阅模式下整份即为法国节点)
+	if (frNames.length && !FRonly) groups.push(法国组 + ' = select, ' + [...frNames, 节点选择].map(loonq).join(', '));
 
 	const rules = (await 获取Clash规则(env)).map(clashRuleToLoon);
 	if (!rules.some(r => r.startsWith('FINAL,'))) rules.push('FINAL,' + 漏网);

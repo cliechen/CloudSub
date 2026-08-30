@@ -338,8 +338,8 @@ export default {
 			//  4) 防惊群锁:缓存 cold 时仅一个请求承担全量拉取,其余等待读取结果。
 			// 追加 &refresh 强制重建;未绑定 KV 时退化为实时聚合。
 			// 缓存因子附带中国 IP 数据版本:IP 段更新后自动生成新缓存键,避免复用旧 GeoIP 结果;
-			// 屏蔽词同样纳入:配置变化后自动生成新缓存键,不复用旧结果
-			const 缓存因子 = [MainData, 订阅链接数组.join('\n'), [...协议过滤].sort().join(','), env.WARP || '', 剔除大陆 ? '1:' + (中国IP数据?.版本 || '0') : '0', [...屏蔽词].sort().join(',')].join('\u0001');
+			// 屏蔽词、节点上限同样纳入:配置变化后自动生成新缓存键,不复用旧结果(否则 SUBMAXNODES 调小后仍返回旧的大截断结果)
+			const 缓存因子 = [MainData, 订阅链接数组.join('\n'), [...协议过滤].sort().join(','), env.WARP || '', 剔除大陆 ? '1:' + (中国IP数据?.版本 || '0') : '0', [...屏蔽词].sort().join(','), String(拉取限制.nodes)].join('\u0001');
 			const 缓存键 = await hashText(缓存因子);
 			const KV缓存键 = 'SUB_AGG:' + 缓存键;
 			const 时间戳键 = 'SUB_AGG_AT:' + 缓存键;
@@ -409,6 +409,13 @@ export default {
 
 
 			// 构建响应头对象
+			const FRonly = url.searchParams.has('fr');
+			// ?fr:仅保留法国节点(白名单)。法国 GeoIP/名称二路分类,IP 匹配走获取法国IP数据。
+			// 法国专属订阅复用聚合缓存(SUB_AGG),仅格式成品走独立 FMT:fr: 缓存键(含 IP 数据版本)。
+			const frIpData = FRonly ? await 获取法国IP数据(env) : null;
+			const 输出结果 = FRonly ? 仅保留法国节点(过滤结果, frIpData) : 过滤结果;
+			const FMT前缀 = 'FMT:' + (FRonly ? ('fr:' + (frIpData && frIpData.版本 ? frIpData.版本 : '0') + ':') : '') + 缓存键;
+
 			const responseHeaders = {
 				"content-type": "text/plain; charset=utf-8",
 				"cache-control": "private, no-store",
@@ -420,9 +427,9 @@ export default {
 			};
 
 			// ===== 订阅响应 ETag:支持客户端条件请求 =====
-			// ETag 取「过滤结果 + 格式」的哈希:内容或格式变化时 ETag 才变化;
+			// ETag 取「输出结果 + 格式」的哈希:内容或格式变化时 ETag 才变化;
 			// 客户端带 If-None-Match 且未变化时直接返回 304,不重复生成/编码配置。
-			const 内容ETag = '"' + await hashText(过滤结果 + ':' + 订阅格式) + '"';
+			const 内容ETag = '"' + await hashText(输出结果 + ':' + 订阅格式 + (FRonly ? ':fr' : '')) + '"';
 			responseHeaders["ETag"] = 内容ETag;
 			if (request.headers.get('If-None-Match') === 内容ETag) {
 				return new Response(null, {
@@ -440,10 +447,10 @@ export default {
 				// 避免对 2MB 级大订阅每次做一次无谓的 base64 编码。
 				let base64Data;
 				try {
-					base64Data = btoa(过滤结果);
+					base64Data = btoa(输出结果);
 				} catch (e) {
 					// btoa 对非 Latin1 字符串抛错,回退为 UTF-8 -> base64(处理含中文的订阅名)
-					const binary = new TextEncoder().encode(过滤结果);
+					const binary = new TextEncoder().encode(输出结果);
 					let base64 = '';
 					const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 					for (let i = 0; i < binary.length; i += 3) {
@@ -462,34 +469,34 @@ export default {
 			} else if (订阅格式 == 'clash') {
 				// ===== 方案A:本地生成 Clash 配置,不依赖第三方 SUBAPI =====
 				// 分流规则优先使用 KV 缓存的 ACL4SSR 规则集,无 KV 时回退内置精简规则
-				const 本地Clash配置 = await 生成配置缓存('FMT:' + 缓存键 + ':clash:' + fileName, () => 生成本地Clash配置(过滤结果, env, fileName), 强制刷新);
+				const 本地Clash配置 = await 生成配置缓存(FMT前缀 + ':clash:' + fileName, () => 生成本地Clash配置(输出结果, env, fileName, FRonly), 强制刷新);
 				if (!userAgent.includes('mozilla')) responseHeaders["Content-Disposition"] = `attachment; filename*=utf-8''${encodeURIComponent(fileName)}`;
 				return new Response(本地Clash配置, { headers: responseHeaders });
 			} else if (订阅格式 == 'singbox') {
 				// ===== 方案A:本地生成 sing-box 配置,不依赖第三方 SUBAPI =====
 				// 复用 uriToClashProxy 解析节点,再转换为 sing-box outbounds + route
-				const 本地Singbox配置 = await 生成配置缓存('FMT:' + 缓存键 + ':singbox:' + fileName, () => 生成本地Singbox配置(过滤结果, env, fileName), 强制刷新);
+				const 本地Singbox配置 = await 生成配置缓存(FMT前缀 + ':singbox:' + fileName, () => 生成本地Singbox配置(输出结果, env, fileName, FRonly), 强制刷新);
 				if (!userAgent.includes('mozilla')) responseHeaders["Content-Disposition"] = `attachment; filename*=utf-8''${encodeURIComponent(fileName)}`;
 				return new Response(本地Singbox配置, { headers: responseHeaders });
 			} else if (订阅格式 == 'surge') {
 				// ===== 方案A:本地生成 Surge 配置,不依赖第三方 SUBAPI =====
 				// 复用 uriToClashProxy 解析节点,转换为 Surge [Proxy] + [Proxy Group] + [Rule]
 				// 注意:Surge 不支持 vless / ssr / hysteria(v1),这些协议的节点会被自动跳过
-				const 本地Surge配置 = await 生成配置缓存('FMT:' + 缓存键 + ':surge:' + fileName, () => 生成本地Surge配置(过滤结果, env, fileName, request.url), 强制刷新);
+				const 本地Surge配置 = await 生成配置缓存(FMT前缀 + ':surge:' + fileName, () => 生成本地Surge配置(输出结果, env, fileName, request.url, FRonly), 强制刷新);
 				if (!userAgent.includes('mozilla')) responseHeaders["Content-Disposition"] = `attachment; filename*=utf-8''${encodeURIComponent(fileName)}`;
 				return new Response(本地Surge配置, { headers: responseHeaders });
 			} else if (订阅格式 == 'quanx') {
 				// ===== 方案A:本地生成 Quantumult X 配置,不依赖第三方 SUBAPI =====
 				// 复用 uriToClashProxy 解析节点,转换为 [server_local] + [policy] + [filter_local]
 				// 注意:QX 不支持 tuic/wireguard/socks5/anytls,这些协议节点会被自动跳过
-				const 本地Quanx配置 = await 生成配置缓存('FMT:' + 缓存键 + ':quanx:' + fileName, () => 生成本地Quanx配置(过滤结果, env, fileName), 强制刷新);
+				const 本地Quanx配置 = await 生成配置缓存(FMT前缀 + ':quanx:' + fileName, () => 生成本地Quanx配置(输出结果, env, fileName, FRonly), 强制刷新);
 				if (!userAgent.includes('mozilla')) responseHeaders["Content-Disposition"] = `attachment; filename*=utf-8''${encodeURIComponent(fileName)}`;
 				return new Response(本地Quanx配置, { headers: responseHeaders });
 			} else if (订阅格式 == 'loon') {
 				// ===== 方案A:本地生成 Loon 配置,不依赖第三方 SUBAPI =====
 				// 复用 uriToClashProxy 解析节点,转换为 [Proxy] + [Proxy Group] + [Rule]
 				// 注意:Loon 不支持 socks5/tuic/anytls,这些协议节点会被自动跳过
-				const 本地Loon配置 = await 生成配置缓存('FMT:' + 缓存键 + ':loon:' + fileName, () => 生成本地Loon配置(过滤结果, env, fileName), 强制刷新);
+				const 本地Loon配置 = await 生成配置缓存(FMT前缀 + ':loon:' + fileName, () => 生成本地Loon配置(输出结果, env, fileName, FRonly), 强制刷新);
 				if (!userAgent.includes('mozilla')) responseHeaders["Content-Disposition"] = `attachment; filename*=utf-8''${encodeURIComponent(fileName)}`;
 				return new Response(本地Loon配置, { headers: responseHeaders });
 			}

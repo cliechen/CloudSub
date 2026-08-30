@@ -16,6 +16,7 @@
 8. **节点校验加固**：全协议字段按 mihomo 实测校验，非法节点整节点丢弃，避免单个坏节点导致客户端拒绝加载整个配置
 9. **本地 GeoIP 剔除**：可选剔除中国大陆节点，本地 IP 段二分匹配，不请求第三方查询接口
 10. **屏蔽警示/占位节点**：服务器为本地地址（127.x / 0.0.0.0 / localhost）的节点默认剔除（如公开源注入的「防范境外势力渗透」系列），另支持按节点名称关键词屏蔽（`BLOCKWORDS` 配置）
+11. **法国节点专属分组**：结构化配置（Clash / sing-box / Surge / Quantumult X / Loon）会自动生成「🇫🇷 法国节点」策略组，聚合法国节点并单独成组，方便按需切换；在任意格式订阅地址后追加 `?fr` / `&fr` 参数，可获取**仅含法国节点的专属订阅**，使用本地 GeoIP（ipdeny 法国 CIDR，7 天缓存）+ 名称关键词二路识别，零第三方查询。
 
 ## 🚀 快速部署
 
@@ -34,7 +35,7 @@
 ### 使用
 
 - 管理页地址：`https://<你的域名>/<TOKEN>`，在页面中添加自建节点链接和机场订阅链接（每行一个）
-- 客户端订阅地址：`https://<你的域名>/sub?token=<SUBTOKEN>`，按客户端 UA 自动适配格式；如需指定格式，追加 `&clash`、`&singbox`、`&surge`、`&quanx`、`&loon` 参数
+- 客户端订阅地址：`https://<你的域名>/sub?token=<SUBTOKEN>`，按客户端 UA 自动适配格式；如需指定格式，追加 `&clash`、`&singbox`、`&surge`、`&quanx`、`&loon` 参数；追加 `?fr` / `&fr` 参数获取仅含法国节点的专属订阅
 
 > 订阅源支持 Clash YAML、sing-box / v2ray JSON、Surge / Loon / Quantumult X 配置、SS JSON、Clash JSON、base64 与明文节点链接。
 
