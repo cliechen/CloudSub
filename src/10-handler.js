@@ -414,7 +414,17 @@ export default {
 			// 法国专属订阅复用聚合缓存(SUB_AGG),仅格式成品走独立 FMT:fr: 缓存键(含 IP 数据版本)。
 			const frIpData = FRonly ? await 获取法国IP数据(env) : null;
 			const 输出结果 = FRonly ? 仅保留法国节点(过滤结果, frIpData) : 过滤结果;
-			const FMT前缀 = 'FMT:' + (FRonly ? ('fr:' + (frIpData && frIpData.版本 ? frIpData.版本 : '0') + ':') : '') + 缓存键;
+			// Clash 需区分 mihomo/旧版(legacy)以避免旧版因 hysteria2/reality 等扩展字段无法启动
+			// 仅 mihomo/meta/verge 等新核保留扩展, 旧版 Clash(含 clashoo/clashforandroid) 过滤
+			const isMihomoReq = (() => {
+				const s = String(userAgent || '').toLowerCase();
+				if (!s || s === 'null') return true;
+				if (s.includes('clashoo')) return false;
+				if (/mihomo|meta|verge|nyanpasu|stash|metaforandroid/i.test(s)) return true;
+				if (s.includes('clash')) return false;
+				return false;
+			})();
+			const FMT前缀 = 'FMT:' + (FRonly ? ('fr:' + (frIpData && frIpData.版本 ? frIpData.版本 : '0') + ':') : '') + (订阅格式 === 'clash' ? (isMihomoReq ? 'm:' : 'l:') : '') + 缓存键;
 
 			const responseHeaders = {
 				"content-type": "text/plain; charset=utf-8",
@@ -428,8 +438,9 @@ export default {
 
 			// ===== 订阅响应 ETag:支持客户端条件请求 =====
 			// ETag 取「输出结果 + 格式」的哈希:内容或格式变化时 ETag 才变化;
+			// Clash 需区分 mihomo/legacy 否则旧版会命中新版缓存的 304
 			// 客户端带 If-None-Match 且未变化时直接返回 304,不重复生成/编码配置。
-			const 内容ETag = '"' + await hashText(输出结果 + ':' + 订阅格式 + (FRonly ? ':fr' : '')) + '"';
+			const 内容ETag = '"' + await hashText(输出结果 + ':' + 订阅格式 + (FRonly ? ':fr' : '') + (订阅格式 === 'clash' && !isMihomoReq ? ':legacy' : '')) + '"';
 			responseHeaders["ETag"] = 内容ETag;
 			if (request.headers.get('If-None-Match') === 内容ETag) {
 				return new Response(null, {
@@ -469,7 +480,8 @@ export default {
 			} else if (订阅格式 == 'clash') {
 				// ===== 方案A:本地生成 Clash 配置,不依赖第三方 SUBAPI =====
 				// 分流规则优先使用 KV 缓存的 ACL4SSR 规则集,无 KV 时回退内置精简规则
-				const 本地Clash配置 = await 生成配置缓存(FMT前缀 + ':clash:' + fileName, () => 生成本地Clash配置(输出结果, env, fileName, FRonly), 强制刷新);
+				// 兼容旧版 Clash(clashoo/premium): 非 mihomo 客户端自动过滤 hysteria2/tuic 等扩展
+				const 本地Clash配置 = await 生成配置缓存(FMT前缀 + ':clash:' + fileName, () => 生成本地Clash配置(输出结果, env, fileName, FRonly, userAgent), 强制刷新);
 				if (!userAgent.includes('mozilla')) responseHeaders["Content-Disposition"] = `attachment; filename*=utf-8''${encodeURIComponent(fileName)}`;
 				return new Response(本地Clash配置, { headers: responseHeaders });
 			} else if (订阅格式 == 'singbox') {

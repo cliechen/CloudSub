@@ -1,17 +1,38 @@
 // ===== 本地生成完整 Clash YAML =====
-async function 生成本地Clash配置(节点文本, env, fileName = DEFAULT_FILE_NAME, FRonly = false) {
+// 兼容性: 旧版 Clash(clash/clash-premium/clashoo) 不支持 hysteria2/tuic/wireguard/anytls/hysteria/reality 等 mihomo 扩展
+// 为避免此类节点导致整个配置无法启动,默认按 UA 区分: mihomo/meta/verge 保留全部, 其余仅保留通用类型
+const CLASH_LEGACY_TYPES = new Set(['ss', 'ssr', 'vmess', 'vless', 'trojan', 'http', 'https', 'socks', 'socks5', 'snell']);
+function isMihomoUA(ua) {
+	if (!ua) return true; // 默认按 mihomo（测试/无 UA 时保留完整功能及 emoji）
+	const s = String(ua).toLowerCase();
+	if (s.includes('clashoo')) return false;
+	// 明确的 mihomo 系客户端才视为支持扩展类型, 否则按旧版 Clash(clash/clashforandroid) 过滤以免整配置无法启动
+	if (s.includes('mihomo') || s.includes('meta') || s.includes('verge') || s.includes('nyanpasu') || s.includes('stash') || s.includes('metaforandroid')) return true;
+	if (s.includes('clash')) return false;
+	return false;
+}
+async function 生成本地Clash配置(节点文本, env, fileName = DEFAULT_FILE_NAME, FRonly = false, userAgent = '') {
 	const lines = String(节点文本 || '').split('\n').map(s => s.trim()).filter(Boolean);
 	const proxies = [];
 	const frIndices = [];
+	const mihomo = isMihomoUA(userAgent);
+	const 法国组 = mihomo ? '🇫🇷 法国节点' : 'France'; // 旧版 clashoo 对 emoji 解析较弱, 用纯 ASCII 兼容
 	for (const line of lines) {
 		let p;
 		try { p = uriToClashProxy(line); } catch (e) { p = null; } // 单节点解析失败只跳过该节点
-		if (p && 校验节点(p)) { // 校验合法才收入
-			if (!FRonly && 是否法国节点(line, null)) frIndices.push(proxies.length);
-			proxies.push(p);
+		if (!p || !校验节点(p)) continue;
+		// 旧版 Clash 兼容: 非 mihomo 客户端跳过 mihomo 扩展类型及 reality,避免整配置无法加载
+		if (!mihomo) {
+			if (!CLASH_LEGACY_TYPES.has(p.type)) continue;
+			if (p['reality-opts']) continue;
 		}
+		if (!FRonly && 是否法国节点(line, null)) frIndices.push(proxies.length);
+		proxies.push(p);
 	}
-	if (proxies.length === 0) return '# 无可用节点\n';
+	if (proxies.length === 0) {
+		// 返回最小可启动空配置,而非纯注释(否则 OpenClash 的 ruby YAML 校验会判 NO_CONTENT)
+		return ['mixed-port: 7890','allow-lan: false','mode: rule','log-level: info','','proxies: []','','proxy-groups: []','','rules: []'].join('\n') + '\n';
+	}
 
 	// 节点名去重(Clash 要求唯一)。除节点间重名外,还必须规避:
 	//  1) mihomo 内置保留名 DIRECT/REJECT/PASS/COMPATIBLE/REJECT-DROP(实测同名直接导致整个配置加载失败);
@@ -24,7 +45,6 @@ async function 生成本地Clash配置(节点文本, env, fileName = DEFAULT_FIL
 	const 节点选择 = '🚀 节点选择';
 	const 自动选择 = '♻️ 自动选择';
 	const 漏网 = '🐟 漏网之鱼';
-	const 法国组 = '🇫🇷 法国节点';
 	const seenNames = new Set(['DIRECT', 'REJECT', 'PASS', 'COMPATIBLE', 'REJECT-DROP', 直连, 拦截, 媒体, 电报, Ai, 节点选择, 自动选择, 漏网, 法国组]);
 	for (const p of proxies) {
 		let n = p.name;
