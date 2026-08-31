@@ -437,7 +437,8 @@ export default {
 			const isMihomoReq = (() => {
 				const s = String(userAgent || '').toLowerCase();
 				if (!s || s === 'null') return true;
-				if (s.includes('clashoo')) return true;
+				// OpenClash(OpenWrt)默认内核为 mihomo,FlClash 为 mihomo 内核 GUI,均按 mihomo 处理(与 isMihomoUA 一致)
+				if (s.includes('clashoo') || s.includes('openclash') || s.includes('flclash')) return true;
 				if (/mihomo|meta|verge|nyanpasu|stash|metaforandroid/i.test(s)) return true;
 				if (s.includes('clash')) return false;
 				return false;

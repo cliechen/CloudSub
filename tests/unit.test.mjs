@@ -593,6 +593,40 @@ await t('Clash 订阅: 无 UA + ?clash 保留 mihomo 扩展节点(不与旧版 C
 	}
 });
 
+await t('Clash 订阅: OpenClash/FlClash UA 按 mihomo 处理,保留扩展节点(回归: 空配置)', async () => {
+	const TOKEN = '550e8400-e29b-41d4-a716-446655440000';
+	const key = Buffer.from('a'.repeat(32)).toString('base64');
+	const NODES = [
+		'hysteria2://hpw@6.6.6.6:443?sni=h.com#hy2-01',
+		'tuic://00000000-0000-0000-0000-000000000000:pw@7.7.7.7:443?sni=t.com#tuic-01',
+		'wireguard://8.8.8.8:51820?pvtkey=' + key + '&pubkey=' + key + '&ip=10.0.0.2#wg-01',
+	].join('\n');
+	const store = new Map([['LINK.txt', NODES]]);
+	const kv = {
+		async get(key) { return store.get(key) || null; },
+		async put(key, value) { store.set(key, String(value)); },
+		async delete(key) { store.delete(key); },
+	};
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async () => { throw new Error('本测试不应拉取上游'); };
+	try {
+		const env = { KV: kv, TOKEN: 'admin', SUBTOKEN: TOKEN };
+		for (const ua of ['OpenClash/0.45.141', 'FlClash/1.4.3']) {
+			const res = await worker.fetch(new Request('https://worker.example/sub?token=' + TOKEN + '&clash', {
+				headers: { 'User-Agent': ua },
+			}), env, { waitUntil() {} });
+			assert.equal(res.status, 200);
+			const text = await res.text();
+			assert.ok(text.includes('hy2-01'), `${ua}: hy2 节点应保留(OpenClash/FlClash 内核为 mihomo)`);
+			assert.ok(text.includes('tuic-01'), `${ua}: tuic 节点应保留`);
+			assert.ok(text.includes('wg-01'), `${ua}: wireguard 节点应保留`);
+			assert.ok(!text.includes('proxies: []'), `${ua}: 不应返回空配置`);
+		}
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
 await t('生成本地Surge配置: 输出各段落, 跳过 vless', async () => {
 	const nodes = [
 		'vless://00000000-0000-0000-0000-000000000000@1.2.3.4:443?type=tcp#vl',

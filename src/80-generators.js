@@ -11,7 +11,9 @@ function isMihomoUA(ua) {
 	if (s === 'null') return true;
 	// Clashoo(kenzok8/openwrt-clashoo)基于 mihomo + sing-box 双内核,支持 mihomo 全部扩展协议,按 mihomo 处理;
 	// 否则会把这些节点静默过滤掉,Clashoo 订阅缺节点。
-	if (s.includes('clashoo')) return true;
+	// OpenClash(OpenWrt)默认内核即为 mihomo(Meta),FlClash 亦为 mihomo 内核 GUI;
+	// 若按旧版 Clash 过滤,hy2/tuic/wireguard 等扩展节点会被全部剔除,聚合订阅只剩空配置。
+	if (s.includes('clashoo') || s.includes('openclash') || s.includes('flclash')) return true;
 	// 明确的 mihomo 系客户端才视为支持扩展类型, 否则按旧版 Clash(clash/clashforandroid) 过滤以免整配置无法启动
 	if (s.includes('mihomo') || s.includes('meta') || s.includes('verge') || s.includes('nyanpasu') || s.includes('stash') || s.includes('metaforandroid')) return true;
 	if (s.includes('clash')) return false;
