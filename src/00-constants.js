@@ -2,7 +2,7 @@
 // TOKEN 仅用于管理页面；SUBTOKEN/SUBUUID 用于客户端订阅请求。
 
 const DEFAULT_TOKEN = 'auto';
-const DEPLOY_VERSION = 'v2.8.1';
+const DEPLOY_VERSION = 'v2.8.2';
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const DEFAULT_FILE_NAME = 'CloudSub';
 const DEFAULT_UPDATE_TIME = 6;

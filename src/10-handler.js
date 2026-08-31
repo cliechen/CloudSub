@@ -91,9 +91,17 @@ async function 保存源条件(env, 新表, ttlHours = 24) {
 async function 执行聚合刷新({ MainData, 订阅链接数组, 协议过滤, 剔除大陆, 中国IP数据, 屏蔽词, WARP, env, request, 追加UA, userAgentHeader, fileName, 拉取限制, KV缓存键, 时间戳键, SUBUpdateTime, 写缓存, 旧缓存 }) {
 	const etags = await 读取源条件(env, 订阅链接数组);
 	const 标记 = {};
+	const 请求预算 = { remaining: 50 }; // 初始拉取、304 补拉与读取重试共用 Workers 子请求额度
 	let req_data = MainData;
 	if (订阅链接数组.length > 0) {
-		let 订阅内容 = await getSUB(订阅链接数组, request, 追加UA, userAgentHeader, fileName, 拉取限制, { etags, 标记 });
+		let 订阅内容 = await getSUB(订阅链接数组, request, 追加UA, userAgentHeader, fileName, 拉取限制, { etags, 标记, 请求预算 });
+		// 刷新期间只要有源失败、超限或内容无法解析,就不能用残缺结果覆盖旧缓存。
+		// 冷启动没有旧缓存时仍返回成功源,避免单个坏源拖垮整份订阅。
+		if (标记.不完整 && 旧缓存) {
+			console.log('订阅源本轮获取不完整,保留旧聚合缓存');
+			内存缓存放(KV缓存键, 旧缓存);
+			return null;
+		}
 		// 全部源 304(未变化)且有旧缓存可复用:沿用旧值,仅续期时间戳,不下载、不重建。
 		if (标记.全部未变化 && 旧缓存) {
 			if (写缓存 && env.KV) {
@@ -102,17 +110,33 @@ async function 执行聚合刷新({ MainData, 订阅链接数组, 协议过滤, 
 			内存缓存放(KV缓存键, 旧缓存);
 			return null;
 		}
-		// 全部源 304 但无旧缓存(缓存已过期而 ETag 仍有效):不能据 304 重建内容,
-		// 必须去条件化重拉一次,否则会缓存一份缺失所有订阅源节点的残缺结果。
+		// 全部源 304 但无旧缓存时,不能用空 body 重建内容,必须去条件化重拉全部源。
 		if (标记.全部未变化) {
 			console.log('全部源 304 但无旧缓存,已去条件化重拉,避免缓存残缺结果');
 			const 新标记 = {};
-			订阅内容 = await getSUB(订阅链接数组, request, 追加UA, userAgentHeader, fileName, 拉取限制, { etags: null, 标记: 新标记 });
+			订阅内容 = await getSUB(订阅链接数组, request, 追加UA, userAgentHeader, fileName, 拉取限制, { etags: null, 标记: 新标记, 请求预算 });
+			标记.不完整 = !!(标记.不完整 || 新标记.不完整);
+			if (新标记.不完整 && 旧缓存) {
+				console.log('去条件化重拉不完整,保留旧聚合缓存');
+				内存缓存放(KV缓存键, 旧缓存);
+				return null;
+			}
 			标记.新etags = 新标记.新etags || 标记.新etags;
+		} else if (标记.含未变化) {
+			// 混合响应时,本轮 200 源已经有完整 body,只补拉 304 源,避免全量重拉消耗子请求额度。
+			console.log('部分源 304,仅去条件化重拉未变化源,避免节点丢失');
+			const 新标记 = {};
+			const 补拉内容 = await getSUB(标记.未变化源 || [], request, 追加UA, userAgentHeader, fileName, 拉取限制, { etags: null, 标记: 新标记, 请求预算 });
+			标记.不完整 = !!(标记.不完整 || 新标记.不完整);
+			if (新标记.不完整 && 旧缓存) {
+				console.log('未变化源补拉不完整,保留旧聚合缓存');
+				内存缓存放(KV缓存键, 旧缓存);
+				return null;
+			}
+			if (补拉内容.length > 0) 订阅内容 = [...订阅内容, ...补拉内容];
+			标记.新etags = { ...(标记.新etags || {}), ...(新标记.新etags || {}) };
 		}
 		if (订阅内容.length > 0) req_data += '\n' + 订阅内容.join('\n');
-		// 持久化本次获取到的最新源 ETag(与缓存同 TTL,避免 ETag 比缓存活得久)
-		if (标记.新etags) await 保存源条件(env, 标记.新etags, SUBUpdateTime);
 	}
 
 	if (WARP) {
@@ -147,6 +171,10 @@ async function 执行聚合刷新({ MainData, 订阅链接数组, 协议过滤, 
 	// 新聚合结果已生成:清掉按旧结果生成的格式成品缓存(FMT:*),避免后续请求复用旧格式配置
 	if (写缓存) {
 		for (const k of 内存缓存.keys()) { if (k.startsWith('FMT:')) 内存缓存.delete(k); }
+	}
+	// 仅在完整结果生成后保存 ETag,避免失败刷新让后续请求继续收到 304 而无法恢复。
+	if (env.KV && 订阅链接数组.length > 0 && !标记.不完整 && 标记.新etags) {
+		await 保存源条件(env, 标记.新etags, SUBUpdateTime);
 	}
 	内存缓存放(KV缓存键, 过滤结果);
 	return 过滤结果;
@@ -226,7 +254,7 @@ export default {
 		// 管理页识别:浏览器 UA 或 Accept: text/html 任一满足即可(UA 可伪造,Accept 更贴近真实页面请求);
 		// 管理页内保存请求均带 Accept: text/html,详见 95-admin.js。
 		const isManagementRequest = isAdminAuth && (userAgent.includes('mozilla') || String(request.headers.get('Accept') || '').toLowerCase().includes('text/html')) && (
-			isPathAdminAuth || (token === adminToken && url.pathname === '/') || (url.searchParams.get('save') === 'protocol' && isAdminAuth)
+			isPathAdminAuth || token === adminToken
 		);
 		if (!(isAdminAuth || isSubscriptionAuth)) {
 			// 通知改为后台异步(ctx.waitUntil)发送,不再阻塞请求响应
@@ -399,7 +427,7 @@ export default {
 			} catch (e) { 拿锁 = true; } // 无 KV 或失败则直接在本请求内重建
 			if (拿锁) {
 				try {
-					过滤结果 = await 执行聚合刷新({ ...刷新参数, 写缓存: !!env.KV, 旧缓存: null });
+					过滤结果 = await 执行聚合刷新({ ...刷新参数, 写缓存: !!env.KV, 旧缓存: KV值 || null }) || KV值 || '';
 				} finally {
 					if (env.KV && 我的锁值) {
 						try {
@@ -417,7 +445,7 @@ export default {
 				}
 				// 仍未取到(无 KV 或等待超时):直接同步聚合兜底
 				if (!过滤结果) {
-					过滤结果 = await 执行聚合刷新({ ...刷新参数, 写缓存: !!env.KV, 旧缓存: null }) || '';
+					过滤结果 = await 执行聚合刷新({ ...刷新参数, 写缓存: !!env.KV, 旧缓存: KV值 || null }) || KV值 || '';
 				}
 				if (过滤结果) 内存缓存放(KV缓存键, 过滤结果);
 			}

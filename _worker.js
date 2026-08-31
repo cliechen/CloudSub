@@ -2,7 +2,7 @@
 // TOKEN 仅用于管理页面；SUBTOKEN/SUBUUID 用于客户端订阅请求。
 
 const DEFAULT_TOKEN = 'auto';
-const DEPLOY_VERSION = 'v2.8.1';
+const DEPLOY_VERSION = 'v2.8.2';
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const DEFAULT_FILE_NAME = 'CloudSub';
 const DEFAULT_UPDATE_TIME = 6;
@@ -127,9 +127,17 @@ async function 保存源条件(env, 新表, ttlHours = 24) {
 async function 执行聚合刷新({ MainData, 订阅链接数组, 协议过滤, 剔除大陆, 中国IP数据, 屏蔽词, WARP, env, request, 追加UA, userAgentHeader, fileName, 拉取限制, KV缓存键, 时间戳键, SUBUpdateTime, 写缓存, 旧缓存 }) {
 	const etags = await 读取源条件(env, 订阅链接数组);
 	const 标记 = {};
+	const 请求预算 = { remaining: 50 }; // 初始拉取、304 补拉与读取重试共用 Workers 子请求额度
 	let req_data = MainData;
 	if (订阅链接数组.length > 0) {
-		let 订阅内容 = await getSUB(订阅链接数组, request, 追加UA, userAgentHeader, fileName, 拉取限制, { etags, 标记 });
+		let 订阅内容 = await getSUB(订阅链接数组, request, 追加UA, userAgentHeader, fileName, 拉取限制, { etags, 标记, 请求预算 });
+		// 刷新期间只要有源失败、超限或内容无法解析,就不能用残缺结果覆盖旧缓存。
+		// 冷启动没有旧缓存时仍返回成功源,避免单个坏源拖垮整份订阅。
+		if (标记.不完整 && 旧缓存) {
+			console.log('订阅源本轮获取不完整,保留旧聚合缓存');
+			内存缓存放(KV缓存键, 旧缓存);
+			return null;
+		}
 		// 全部源 304(未变化)且有旧缓存可复用:沿用旧值,仅续期时间戳,不下载、不重建。
 		if (标记.全部未变化 && 旧缓存) {
 			if (写缓存 && env.KV) {
@@ -138,17 +146,33 @@ async function 执行聚合刷新({ MainData, 订阅链接数组, 协议过滤, 
 			内存缓存放(KV缓存键, 旧缓存);
 			return null;
 		}
-		// 全部源 304 但无旧缓存(缓存已过期而 ETag 仍有效):不能据 304 重建内容,
-		// 必须去条件化重拉一次,否则会缓存一份缺失所有订阅源节点的残缺结果。
+		// 全部源 304 但无旧缓存时,不能用空 body 重建内容,必须去条件化重拉全部源。
 		if (标记.全部未变化) {
 			console.log('全部源 304 但无旧缓存,已去条件化重拉,避免缓存残缺结果');
 			const 新标记 = {};
-			订阅内容 = await getSUB(订阅链接数组, request, 追加UA, userAgentHeader, fileName, 拉取限制, { etags: null, 标记: 新标记 });
+			订阅内容 = await getSUB(订阅链接数组, request, 追加UA, userAgentHeader, fileName, 拉取限制, { etags: null, 标记: 新标记, 请求预算 });
+			标记.不完整 = !!(标记.不完整 || 新标记.不完整);
+			if (新标记.不完整 && 旧缓存) {
+				console.log('去条件化重拉不完整,保留旧聚合缓存');
+				内存缓存放(KV缓存键, 旧缓存);
+				return null;
+			}
 			标记.新etags = 新标记.新etags || 标记.新etags;
+		} else if (标记.含未变化) {
+			// 混合响应时,本轮 200 源已经有完整 body,只补拉 304 源,避免全量重拉消耗子请求额度。
+			console.log('部分源 304,仅去条件化重拉未变化源,避免节点丢失');
+			const 新标记 = {};
+			const 补拉内容 = await getSUB(标记.未变化源 || [], request, 追加UA, userAgentHeader, fileName, 拉取限制, { etags: null, 标记: 新标记, 请求预算 });
+			标记.不完整 = !!(标记.不完整 || 新标记.不完整);
+			if (新标记.不完整 && 旧缓存) {
+				console.log('未变化源补拉不完整,保留旧聚合缓存');
+				内存缓存放(KV缓存键, 旧缓存);
+				return null;
+			}
+			if (补拉内容.length > 0) 订阅内容 = [...订阅内容, ...补拉内容];
+			标记.新etags = { ...(标记.新etags || {}), ...(新标记.新etags || {}) };
 		}
 		if (订阅内容.length > 0) req_data += '\n' + 订阅内容.join('\n');
-		// 持久化本次获取到的最新源 ETag(与缓存同 TTL,避免 ETag 比缓存活得久)
-		if (标记.新etags) await 保存源条件(env, 标记.新etags, SUBUpdateTime);
 	}
 
 	if (WARP) {
@@ -183,6 +207,10 @@ async function 执行聚合刷新({ MainData, 订阅链接数组, 协议过滤, 
 	// 新聚合结果已生成:清掉按旧结果生成的格式成品缓存(FMT:*),避免后续请求复用旧格式配置
 	if (写缓存) {
 		for (const k of 内存缓存.keys()) { if (k.startsWith('FMT:')) 内存缓存.delete(k); }
+	}
+	// 仅在完整结果生成后保存 ETag,避免失败刷新让后续请求继续收到 304 而无法恢复。
+	if (env.KV && 订阅链接数组.length > 0 && !标记.不完整 && 标记.新etags) {
+		await 保存源条件(env, 标记.新etags, SUBUpdateTime);
 	}
 	内存缓存放(KV缓存键, 过滤结果);
 	return 过滤结果;
@@ -262,7 +290,7 @@ export default {
 		// 管理页识别:浏览器 UA 或 Accept: text/html 任一满足即可(UA 可伪造,Accept 更贴近真实页面请求);
 		// 管理页内保存请求均带 Accept: text/html,详见 95-admin.js。
 		const isManagementRequest = isAdminAuth && (userAgent.includes('mozilla') || String(request.headers.get('Accept') || '').toLowerCase().includes('text/html')) && (
-			isPathAdminAuth || (token === adminToken && url.pathname === '/') || (url.searchParams.get('save') === 'protocol' && isAdminAuth)
+			isPathAdminAuth || token === adminToken
 		);
 		if (!(isAdminAuth || isSubscriptionAuth)) {
 			// 通知改为后台异步(ctx.waitUntil)发送,不再阻塞请求响应
@@ -435,7 +463,7 @@ export default {
 			} catch (e) { 拿锁 = true; } // 无 KV 或失败则直接在本请求内重建
 			if (拿锁) {
 				try {
-					过滤结果 = await 执行聚合刷新({ ...刷新参数, 写缓存: !!env.KV, 旧缓存: null });
+					过滤结果 = await 执行聚合刷新({ ...刷新参数, 写缓存: !!env.KV, 旧缓存: KV值 || null }) || KV值 || '';
 				} finally {
 					if (env.KV && 我的锁值) {
 						try {
@@ -453,7 +481,7 @@ export default {
 				}
 				// 仍未取到(无 KV 或等待超时):直接同步聚合兜底
 				if (!过滤结果) {
-					过滤结果 = await 执行聚合刷新({ ...刷新参数, 写缓存: !!env.KV, 旧缓存: null }) || '';
+					过滤结果 = await 执行聚合刷新({ ...刷新参数, 写缓存: !!env.KV, 旧缓存: KV值 || null }) || KV值 || '';
 				}
 				if (过滤结果) 内存缓存放(KV缓存键, 过滤结果);
 			}
@@ -573,14 +601,17 @@ export default {
 };
 
 async function ADD(envadd) {
-	var addtext = envadd.replace(/[	"'|\r\n]+/g, '\n').replace(/\n+/g, '\n');	// 替换为换行
-	//console.log(addtext);
-	if (addtext.charAt(0) == '\n') addtext = addtext.slice(1);
-	if (addtext.charAt(addtext.length - 1) == '\n') addtext = addtext.slice(0, addtext.length - 1);
-	const add = addtext.split('\n');
-	//console.log(add);
-	return add;
+	// 仅把列表分隔符转换为换行;引号可能是 URI 凭据或节点名称的一部分,不能无条件删除。
+	const addtext = String(envadd ?? '').replace(/[\t|\r\n]+/g, '\n');
+	return addtext.split('\n').map(item => {
+		const value = item.trim();
+		// 兼容整行被引号包裹的配置项,但保留 URI 内部的引号/单引号。
+		if (value.length >= 2 && ((value[0] === '"' && value.at(-1) === '"') || (value[0] === "'" && value.at(-1) === "'"))) return value.slice(1, -1).trim();
+		return value;
+	}).filter(Boolean);
 }
+
+
 
 async function nginx() {
 	const text = `
@@ -709,36 +740,37 @@ async function proxyURL(proxyURL, url) {
 // 拉取并解析所有订阅源,返回节点 URI 行数组。
 // 为避免"大链接拉取不完整":
 //  - 单个源超过单源上限(SUBMAXSIZE)时整源跳过并记录日志,可调大 SUBMAXSIZE;
-//  - 全部源合计按总预算(SUBMAXTOTAL)兜底:已知大小(content-length)的源按声明大小
-//    预留预算,未知大小(分块传输/动态生成/压缩)的源按较小名义值参与预算分配,
-//    未知/压缩源的实际读取量由读取阶段流式共享预算兜底,不会突破总预算;
+//  - 全部源合计按总预算(SUBMAXTOTAL)兜底:不预先相信 content-length,所有响应体
+//    在读取阶段按实际字节从共享预算扣减,未知/压缩源也不会突破总预算;
 //  - 压缩响应(content-encoding)的 content-length 为压缩后大小,不再作为拒绝依据,
 //    避免大订阅因声明大小误导而被整源丢弃。
 async function getSUB(api, request, 追加UA, userAgentHeader, fileName = DEFAULT_FILE_NAME, 限制 = {}, opts = {}) {
-	const { etags = null, 标记 = {} } = opts || {};
+	const { etags = null, 标记 = {}, 请求预算 = { remaining: 50 } } = opts || {};
 	const 源上限 = Math.max(1, 限制.sources || DEFAULT_MAX_SUB_SOURCES);
 	const 单源上限 = Math.max(1, 限制.perSource || DEFAULT_MAX_SUB_RESPONSE_BYTES);
 	const 总预算 = Math.max(1, 限制.total || DEFAULT_MAX_SUB_TOTAL_BYTES);
 	const 超时 = Math.max(1000, 限制.timeout || DEFAULT_SUB_FETCH_TIMEOUT_MS);
-	// 未知长度订阅源(分块传输/动态生成/压缩响应)在预算分配时按较小名义值估算,
-	// 避免每个源都被按单源上限估算、默认预算(40MB)下只能保留少量来源。
-	const 未知长度估算 = Math.min(单源上限, 512 * 1024);
+	// 未知长度订阅源(分块传输/动态生成/压缩响应)不在响应头阶段预留预算,
+	// 统一在读取 body 时按实际字节扣减总预算。
 
 	if (!api || api.length === 0) return [];
 	api = [...new Set(api)].slice(0, 源上限); // 去重并限制来源数量
 	if (api.length === 0) return [];
 
 	let newapi = "";
-	let 已用预算 = 0;
 	let 未变化数 = 0; // 条件请求下返回 304(内容未变化)的源数量
-	const 释放连接 = response => { try { if (response.body) response.body.cancel().catch(() => {}); } catch (e) { /* 忽略 */ } };
+	let 失败数 = 0; // 本轮未能完整获取的源数量;刷新时不能用残缺结果覆盖旧缓存
+	const 释放连接 = response => { try { if (response?.body) response.body.cancel().catch(() => {}); } catch (e) { /* 忽略 */ } };
 
 	// 阶段1: 并行发起请求(只等响应头,不读 body)。
 	// 失败(网络错误/5xx/429)的源自动重试一次,缓解 raw.githubusercontent 等源常见的
 	// 瞬时连接失败导致整源丢失的问题;超时(AbortError)不重试,避免成倍拉长请求时间。
 	// 重试额度:免费版单请求子请求上限为 50,每次重试(含重定向)都会额外消耗子请求,
 	// 这里限制全部源的重试总次数,避免大量源同时失败时把子请求数翻倍突破上限。
-	let 剩余重试 = Math.min(10, Math.max(2, Math.floor(api.length / 3)));
+	// 初始请求已经占用 api.length 个子请求;免费版单请求通常上限为 50,
+	// 重试必须从剩余额度中扣除,避免 50 个源再追加重试后整份请求被平台中止。
+	const 最大重试数 = Math.max(0, 50 - api.length);
+	let 剩余重试 = Math.min(10, 最大重试数, Math.floor(api.length / 3));
 	// Node/undici 等环境对挂起的连接可能不遵守 AbortSignal.timeout(无限阻塞),导致阶段1 的
 	// Promise.allSettled 也随之无限等待,整个订阅被拖垮(表现为订阅数偏少/卡死)。
 	// 这里用 JS 计时器为每个源的「请求 + 读取」提供硬超时兑底:到点即抛 TimeoutError,
@@ -747,9 +779,15 @@ async function getSUB(api, request, 追加UA, userAgentHeader, fileName = DEFAUL
 		const timer = setTimeout(() => reject(Object.assign(new Error('超时(可调大 SUBMAXTIME)'), { name: 'TimeoutError' })), ms);
 		Promise.resolve(p).then(v => { clearTimeout(timer); resolve(v); }, e => { clearTimeout(timer); reject(e); });
 	});
+	// AbortSignal.timeout 交由环境处理;JS 计时器兜底硬限时,挂起也不无限阻塞。
+	// 所有请求(初始、重试、304 补拉)共用请求级预算,防止大源列表突破 Workers 子请求上限。
+	const 发送请求 = (apiUrl, 条件 = null) => {
+		if (请求预算.remaining <= 0) throw Object.assign(new Error('超过单请求子请求额度'), { name: 'SubrequestLimitError' });
+		请求预算.remaining--;
+		return 带超时(getUrl(request, apiUrl, 追加UA, userAgentHeader, AbortSignal.timeout(超时), 条件), 超时);
+	};
 	const 请求一个源 = async (apiUrl) => {
-		// AbortSignal.timeout 交由环境处理;JS 计时器兜底硬限时,挂起也不无限阻塞
-		const 尝试 = () => 带超时(getUrl(request, apiUrl, 追加UA, userAgentHeader, AbortSignal.timeout(超时), (etags && etags[apiUrl]) || null), 超时);
+		const 尝试 = () => 发送请求(apiUrl, (etags && etags[apiUrl]) || null);
 		const 若可重试 = () => {
 			if (剩余重试 <= 0) return null;
 			剩余重试--;
@@ -782,16 +820,20 @@ async function getSUB(api, request, 追加UA, userAgentHeader, fileName = DEFAUL
 	};
 	const 响应结果 = await Promise.allSettled(api.map(apiUrl => 请求一个源(apiUrl)));
 
-	// 阶段2: 按用户配置顺序分配预算并确定各源读取策略。
-	//  - 未压缩且有 content-length:按声明大小估算(受单源上限约束);
-	//  - 压缩或未知长度:声明不可信/不存在,按较小名义值估算。
-	// 超出总预算的源跳过并释放连接(连接数与子请求数因此可控)。
+	// 阶段2: 按用户配置顺序筛选单源大小限制并确定各源读取策略。
+	// Content-Length 仅用于快速拒绝明确超出单源上限的响应,总预算统一在读取 body 时扣减。
 	const 接受的 = [];
 	for (let i = 0; i < 响应结果.length; i++) {
 		const r = 响应结果[i];
 		const 值 = r.status === 'fulfilled' ? r.value : null;
-		if (值 && 值.__未变化) { 未变化数++; continue; }
+		if (值 && 值.__未变化) {
+			未变化数++;
+			标记.未变化源 = 标记.未变化源 || [];
+			标记.未变化源.push(api[i]);
+			continue;
+		}
 		if (r.status !== 'fulfilled') {
+			失败数++;
 			const reason = r.reason;
 			if (reason && (reason.name === 'AbortError' || reason.name === 'TimeoutError')) {
 				console.log(`订阅源请求超时: ${maskUrl(api[i])}`);
@@ -803,6 +845,7 @@ async function getSUB(api, request, 追加UA, userAgentHeader, fileName = DEFAUL
 		const response = r.value;
 		if (response.status === 304) { 未变化数++; 释放连接(response); continue; }
 		if (!response.ok) {
+			失败数++;
 			console.error(`订阅源请求失败: ${maskUrl(api[i])}, HTTP ${response.status}`);
 			释放连接(response);
 			continue;
@@ -818,26 +861,25 @@ async function getSUB(api, request, 追加UA, userAgentHeader, fileName = DEFAUL
 		const declared = 压缩 ? 0 : Number(response.headers.get('content-length') || 0);
 		// 未压缩且声明大小超过单源上限:整源跳过,避免无谓下载(压缩响应声明不可信,跳过该检查)
 		if (!压缩 && declared > 单源上限) {
+			失败数++;
 			console.log(`订阅源响应超过单源上限,已跳过: ${maskUrl(api[i])}, 大小: ${declared} 字节(可调大 SUBMAXSIZE)`);
 			释放连接(response);
 			continue;
 		}
-		const 估算 = declared > 0 ? Math.min(declared, 单源上限) : 未知长度估算;
-		if (已用预算 + 估算 > 总预算) {
-			console.log(`订阅源超出合计预算,已跳过: ${maskUrl(api[i])}(可调大 SUBMAXTOTAL)`);
-			释放连接(response);
-			continue;
-		}
-		已用预算 += 估算;
+		// 不按 Content-Length 预先消耗总预算:代理/CDN 经常高估或返回压缩后的长度,
+		// 预留会把后面的合法源整份跳过。总预算只在读取 body 时按实际字节扣减。
 		接受的.push({ apiUrl: api[i], response, declared, 压缩 });
 	}
-	// 全部源都 304:聚合内容未变化(后台刷新时借此“不下载、不重建、仅续期”)
+	// 记录是否有源返回 304。304 源不会返回 body,只有“全部 304 + 复用旧缓存”时才可安全省略;
+	// 若与 200 混合,直接把 200 源重建会丢掉所有 304 源的节点,必须由上层触发完整重拉。
+	标记.含未变化 = 未变化数 > 0;
 	标记.全部未变化 = 接受的.length === 0 && 未变化数 === api.length;
+	标记.不完整 = 失败数 > 0;
 	if (接受的.length === 0) return [];
 
 	// 阶段3: 读取已接受源的 body(受单源上限与共享预算约束);瞬时读取失败(连接重置等)
 	// 自动重试一次,避免整源因网络抖动丢失。
-	//  - 未压缩已知长度源:并行读取,读取上限 = 单源上限,阶段2已按声明大小预留预算;
+	//  - 未压缩已知长度源:按单源上限读取,同时受共享总预算约束;
 	//  - 压缩源:声明(压缩后大小)不可信,按总预算读取(实际受共享预算约束),完整保留大订阅;
 	//  - 未知长度源:按单源上限读取;未知与压缩源按配置顺序小并发读取(先配置的源优先
 	//    开始读取、优先占用预算),合计读取量由共享预算兜底,避免大源被“完成晚”误杀。
@@ -846,7 +888,7 @@ async function getSUB(api, request, 追加UA, userAgentHeader, fileName = DEFAUL
 		const 尝试读取 = async (resp) => {
 			const 本次消耗 = 预算 ? { bytes: 0 } : null;
 			try {
-				return await 带超时(readLimitedResponse(resp, 读取上限, 预算, 本次消耗), 超时);
+				return await readLimitedResponse(resp, 读取上限, 预算, 本次消耗, 超时);
 			} catch (e) {
 				if (预算 && 本次消耗 && 本次消耗.bytes > 0) 预算.remaining += 本次消耗.bytes; // 归还本次读取占用的预算
 				throw e;
@@ -858,7 +900,7 @@ async function getSUB(api, request, 追加UA, userAgentHeader, fileName = DEFAUL
 			if (e && (e.name === 'AbortError' || e.name === 'TimeoutError' || e.code === 'SUB_LIMIT')) throw e;
 			await new Promise(r => setTimeout(r, 300)); // 网络级瞬时错误,短暂退避后重新拉取一次
 			释放连接(response);
-			const 重试响应 = await 带超时(getUrl(request, apiUrl, 追加UA, userAgentHeader, AbortSignal.timeout(超时)), 超时);
+			const 重试响应 = await 发送请求(apiUrl);
 			if (!重试响应.ok) { 释放连接(重试响应); throw new Error('重试仍失败: HTTP ' + 重试响应.status); }
 			// 重试响应也必须使用本源的读取上限和同一共享预算；否则重试会绕过限制，
 			// 或在共享预算不足时继续读取并造成结果不稳定。
@@ -867,13 +909,13 @@ async function getSUB(api, request, 追加UA, userAgentHeader, fileName = DEFAUL
 	};
 	const 已知源 = 接受的.filter(x => x.declared > 0);
 	const 未知源 = 接受的.filter(x => x.declared <= 0);
-	const 已预留已知 = 已知源.reduce((s, x) => s + Math.min(x.declared, 单源上限), 0);
-	const 共享预算 = { remaining: Math.max(0, 总预算 - 已预留已知) };
-	const 已知结果 = await Promise.allSettled(已知源.map(({ apiUrl, response }) =>
-		读取重试(apiUrl, response, 单源上限, null)
+	// Content-Length 可能缺失、错误或被上游压缩/代理改写,所有实际读取统一从同一预算扣减。
+	// 声明值只用于阶段2的单源快速筛选,不再预留总预算,避免高估导致后续源被跳过。
+	const 共享预算 = { remaining: 总预算 };
+	const 已知结果 = await 有界并发执行(已知源, 8, async ({ apiUrl, response }) =>
+		读取重试(apiUrl, response, 单源上限, 共享预算)
 			.then(content => ({ apiUrl, content }))
-			.catch(err => { if (err && typeof err === 'object') err.apiUrl = apiUrl; throw err; })
-	));
+	);
 	const 未知结果 = await 有界并发执行(未知源, 8, async ({ apiUrl, response, 压缩 }) =>
 		读取重试(apiUrl, response, 压缩 ? 总预算 : 单源上限, 共享预算)
 			.then(content => ({ apiUrl, content }))
@@ -883,6 +925,7 @@ async function getSUB(api, request, 追加UA, userAgentHeader, fileName = DEFAUL
 	// 阶段4: 按源顺序解析并聚合(已接受的内容不再因后续预算问题丢失)
 	for (const r of 内容结果) {
 		if (r.status !== 'fulfilled') {
+			失败数++;
 			const reason = r.reason;
 			const 错误描述 = (reason && (reason.name === 'AbortError' || reason.name === 'TimeoutError'))
 				? '读取超时(可调大 SUBMAXTIME)'
@@ -902,10 +945,12 @@ async function getSUB(api, request, 追加UA, userAgentHeader, fileName = DEFAUL
 				newapi += parsed.text + '\n';
 			} else {
 				// 响应内容无法识别为任何节点格式(异常/站点页等),仅记录日志便于排查
+				失败数++;
 				console.log(`未能识别的订阅来源: ${maskUrl(apiUrl)}`);
 			}
 		} catch (e) {
 			// 单个订阅源解析失败不影响其他来源的聚合
+			失败数++;
 			console.error(`订阅源解析失败: ${maskUrl(apiUrl)}, 错误: ${e?.message || e}`);
 		}
 	}
@@ -973,17 +1018,37 @@ function escapeJs(value) {
 	return JSON.stringify(String(value ?? '')).replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
 }
 
-async function readLimitedResponse(response, maxBytes, 共享预算 = null, 本次消耗 = null) {
+async function readLimitedResponse(response, maxBytes, 共享预算 = null, 本次消耗 = null, 超时 = 0) {
 	// 压缩响应(content-encoding)的 content-length 是压缩后大小,不代表解压后的实际读取量
 	const contentLength = response.headers.get('content-encoding') ? 0 : Number(response.headers.get('content-length') || 0);
-	if (contentLength > maxBytes) { const e = new Error('订阅响应超过大小限制(可调大 SUBMAXSIZE)'); e.code = 'SUB_LIMIT'; throw e; }
+	if (contentLength > maxBytes) {
+		try { if (response.body) await response.body.cancel(); } catch (e) { /* 忽略取消失败 */ }
+		const e = new Error('订阅响应超过大小限制(可调大 SUBMAXSIZE)'); e.code = 'SUB_LIMIT'; throw e;
+	}
 	if (!response.body) return '';
 	const reader = response.body.getReader();
 	const chunks = [];
 	let total = 0;
+	const 截止时间 = 超时 > 0 ? Date.now() + 超时 : 0;
+	const 读取一块 = async () => {
+		if (!截止时间) return reader.read();
+		const 剩余时间 = 截止时间 - Date.now();
+		if (剩余时间 <= 0) throw Object.assign(new Error('超时(可调大 SUBMAXTIME)'), { name: 'TimeoutError' });
+		let timer;
+		try {
+			return await Promise.race([
+				reader.read(),
+				new Promise((resolve, reject) => {
+					timer = setTimeout(() => reject(Object.assign(new Error('超时(可调大 SUBMAXTIME)'), { name: 'TimeoutError' })), 剩余时间);
+				}),
+			]);
+		} finally {
+			clearTimeout(timer);
+		}
+	};
 	try {
 		while (true) {
-			const { done, value } = await reader.read();
+			const { done, value } = await 读取一块();
 			if (done) break;
 			total += value.byteLength;
 			if (total > maxBytes) { const e = new Error('订阅响应超过大小限制(可调大 SUBMAXSIZE)'); e.code = 'SUB_LIMIT'; throw e; }
@@ -995,6 +1060,10 @@ async function readLimitedResponse(response, maxBytes, 共享预算 = null, 本�
 			}
 			chunks.push(value);
 		}
+	} catch (e) {
+		// 超限、解析失败或底层读错误时立即终止流,避免响应体继续占用连接和内存。
+		try { await reader.cancel(e); } catch (cancelError) { /* 忽略取消失败 */ }
+		throw e;
 	} finally {
 		reader.releaseLock();
 	}
@@ -4706,7 +4775,7 @@ async function KV(request, env, txt = 'ADD.txt', { subscriptionToken, fileName }
 					<div class="editor-container">
 						${hasKV ? `
 						<textarea class="editor" 
-							placeholder="${decodeURIComponent(atob('TElOSyVFNyVBNCVCQSVFNCVCRSU4QiVFRiVCQyU4OCVFNCVCOCU4MCVFOCVBMSU4QyVFNCVCOCU4MCVFNCVCOCVBQSVFOCU4QSU4MiVFNyU4MiVCOSVFOSU5MyVCRSVFNiU4RSVBNSVFNSU4RCVCMyVFNSU4RiVBRiVFRiVCQyU4OSVFRiVCQyU5QQp2bGVzcyUzQSUyRiUyRjI0NmFhNzk1LTA2MzctNGY0Yy04ZjY0LTJjOGZiMjRjMWJhZCU0MDEyNy4wLjAuMSUzQTEyMzQlM0ZlbmNyeXB0aW9uJTNEbm9uZSUyNnNlY3VyaXR5JTNEdGxzJTI2c25pJTNEVEcuQ01MaXVzc3NzLmxvc2V5b3VyaXAuY29tJTI2YWxsb3dJbnNlY3VyZSUzRDElMjZ0eXBlJTNEd3MlMjZob3N0JTNEVEcuQ01MaXVzc3NzLmxvc2V5b3VyaXAuY29tJTI2cGF0aCUzRCUyNTJGJTI1M0ZlZCUyNTNEMjU2MCUyM0NGbmF0CnRyb2phbiUzQSUyRiUyRmFhNmRkZDJmLWQxY2YtNGE1Mi1iYTFiLTI2NDBjNDFhNzg1NiU0MDIxOC4xOTAuMjMwLjIwNyUzQTQxMjg4JTNGc2VjdXJpdHklM0R0bHMlMjZzbmklM0RoazEyLmJpbGliaWxpLmNvbSUyNmFsbG93SW5zZWN1cmUlM0QxJTI2dHlwZSUzRHRjcCUyNmhlYWRlclR5cGUlM0Rub25lJTIzSEsKc3MlM0ElMkYlMkZZMmhoWTJoaE1qQXRhV1YwWmkxd2IyeDVNVE13TlRveVJYUlFjVzQyU0ZscVZVNWpTRzlvVEdaVmNFWlJkMjVtYWtORFVUVnRhREZ0U21SRlRVTkNkV04xVjFvNVVERjFaR3RTUzBodVZuaDFielUxYXpGTFdIb3lSbTgyYW5KbmRERTRWelkyYjNCMGVURmxOR0p0TVdwNlprTm1RbUklMjUzRCU0MDg0LjE5LjMxLjYzJTNBNTA4NDElMjNERQoKCiVFOCVBRSVBMiVFOSU5OCU4NSVFOSU5MyVCRSVFNiU4RSVBNSVFNyVBNCVCQSVFNCVCRSU4QiVFRiVCQyU4OCVFNCVCOCU4MCVFOCVBMSU4QyVFNCVCOCU4MCVFNiU5RCVBMSVFOCVBRSVBMiVFOSU5OCU4NSVFOSU5MyVCRSVFNiU4RSVBNSVFNSU4RCVCMyVFNSU4RiVBRiVFRiVCQyU4OSVFRiVCQyU5QQpodHRwcyUzQSUyRiUyRnN1Yi54Zi5mcmVlLmhyJTJGYXV0bw=='))}"
+							placeholder="每行一个节点或订阅地址，例如：vless://UUID@example.com:443?type=tcp#Example"
 							id="content">${safeContent}</textarea>
 						<script>document.getElementById('content').value = ${contentLiteral};</script>
 						<div class="save-container">

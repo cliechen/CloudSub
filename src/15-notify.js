@@ -1,12 +1,15 @@
 async function ADD(envadd) {
-	var addtext = envadd.replace(/[	"'|\r\n]+/g, '\n').replace(/\n+/g, '\n');	// 替换为换行
-	//console.log(addtext);
-	if (addtext.charAt(0) == '\n') addtext = addtext.slice(1);
-	if (addtext.charAt(addtext.length - 1) == '\n') addtext = addtext.slice(0, addtext.length - 1);
-	const add = addtext.split('\n');
-	//console.log(add);
-	return add;
+	// 仅把列表分隔符转换为换行;引号可能是 URI 凭据或节点名称的一部分,不能无条件删除。
+	const addtext = String(envadd ?? '').replace(/[\t|\r\n]+/g, '\n');
+	return addtext.split('\n').map(item => {
+		const value = item.trim();
+		// 兼容整行被引号包裹的配置项,但保留 URI 内部的引号/单引号。
+		if (value.length >= 2 && ((value[0] === '"' && value.at(-1) === '"') || (value[0] === "'" && value.at(-1) === "'"))) return value.slice(1, -1).trim();
+		return value;
+	}).filter(Boolean);
 }
+
+
 
 async function nginx() {
 	const text = `

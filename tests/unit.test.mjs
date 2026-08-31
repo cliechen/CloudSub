@@ -31,11 +31,12 @@ const tmpWorker = path.join('/tmp', `_worker_unit_${process.pid}.cjs`);
 fs.writeFileSync(
 	tmpWorker,
 	workerSrc +
-		'\nmodule.exports.__test = { hashText, 本地解析订阅内容, 节点去重, 节点协议, 过滤协议节点, 解析节点名, 剔除大陆节点, 屏蔽节点, 是本地服务器地址, parseYamlValue, base64Decode, proxyURL, 生成本地Clash配置, 生成本地Singbox配置, 生成本地Surge配置, 生成本地Quanx配置, 生成本地Loon配置, singboxJSONtoURIs, 迁移地址列表, KV, getSUB, 解析中国IP文本, 中国IP匹配, 节点服务器地址, 仅保留法国节点, 是否法国节点, 清空实例缓存: () => { 内存缓存.clear(); 热点缓存.clear(); SWR调度记录.clear(); 迁移已执行 = false; } };\n'
+		'\nmodule.exports.__test = { hashText, ADD, 本地解析订阅内容, 节点去重, 节点协议, 过滤协议节点, 解析节点名, 剔除大陆节点, 屏蔽节点, 是本地服务器地址, parseYamlValue, base64Decode, proxyURL, 生成本地Clash配置, 生成本地Singbox配置, 生成本地Surge配置, 生成本地Quanx配置, 生成本地Loon配置, singboxJSONtoURIs, 迁移地址列表, KV, getSUB, 解析中国IP文本, 中国IP匹配, 节点服务器地址, 仅保留法国节点, 是否法国节点, 清空实例缓存: () => { 内存缓存.clear(); 热点缓存.clear(); SWR调度记录.clear(); 迁移已执行 = false; } };\n'
 );
 const mod = await import(pathToFileURL(tmpWorker).href);
 const {
 	hashText,
+	ADD,
 	本地解析订阅内容,
 	节点去重,
 	节点协议,
@@ -144,6 +145,13 @@ await t('本地解析: 明文节点', async () => {
 	assert.ok(String(parsed.text).includes('vless://'));
 });
 
+await t('地址列表解析: 保留 URI 内部的引号,兼容整行外层引号', async () => {
+	const uri = "vless://00000000-0000-0000-0000-000000000000@1.2.3.4:443?type=tcp#O'Reilly";
+	assert.deepEqual(await ADD(uri), [uri], '节点名中的单引号不应被删除');
+	assert.deepEqual(await ADD('"' + uri + '"'), [uri], '整行外层双引号应兼容去除');
+	assert.deepEqual(await ADD("'" + uri + "'"), [uri], '整行外层单引号应兼容去除');
+});
+
 await t('节点去重 + 协议过滤', async () => {
 	const text = [
 		'vless://00000000-0000-0000-0000-000000000000@1.2.3.4:443?type=tcp#a',
@@ -215,6 +223,26 @@ await t('getSUB 条件请求:304=未变化不下载,变化才下载', async () =
 		assert.equal(标记3.全部未变化, false);
 		assert.ok(标记3.新etags && 标记3.新etags[SRC], '应记录最新 etag 供下次使用');
 		assert.equal(下载次数, 2, '仅真正变化(200)的两次被下载,304 那次不下载');
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
+await t('getSUB: 初始请求与重试共用子请求预算,不会突破额度', async () => {
+	const sources = ['https://budget-a.example/sub', 'https://budget-b.example/sub'];
+	const originalFetch = globalThis.fetch;
+	let calls = 0;
+	globalThis.fetch = async input => {
+		calls++;
+		return new Response('vless://00000000-0000-0000-0000-000000000000@1.2.3.4:443?type=tcp#budget', { status: 200 });
+	};
+	try {
+		const 标记 = {};
+		const budget = { remaining: 1 };
+		const result = await getSUB(sources, 请求壳, 'v2rayn', 'test', 'T', 默认限制, { 标记, 请求预算: budget });
+		assert.equal(calls, 1, '预算只允许一个子请求');
+		assert.equal(result.length, 1, '额度不足的源不应伪装成成功');
+		assert.equal(标记.不完整, true, '额度不足应标记为不完整,刷新时保护旧缓存');
 	} finally {
 		globalThis.fetch = originalFetch;
 	}
@@ -373,6 +401,50 @@ await t('订阅请求: base64 格式正确输出(含 unicode 节点名)', async 
 		assert.ok(decoded.includes('名称-上海'), 'base64 输出应完整保留 unicode 节点名');
 		assert.ok(decoded.includes('vless://'), 'base64 输出应含节点链接');
 		} finally { /* 本测未 mock fetch,不修改全局 */ }
+});
+
+await t('部分源 304 + 部分源 200:仅补拉未变化源,避免节点批量丢失', async () => {
+	const TOKEN = '550e8400-e29b-41d4-a716-446655440000';
+	const SRC_A = 'https://stable.example/sub';
+	const SRC_B = 'https://changed.example/sub';
+	const store = new Map([
+		['LINK.txt', SRC_A + '\n' + SRC_B],
+		['SUB_ETAG:' + await hashText(SRC_A), JSON.stringify({ etag: 'stable-v1', lastModified: '' })],
+		['SUB_ETAG:' + await hashText(SRC_B), JSON.stringify({ etag: 'changed-v1', lastModified: '' })],
+	]);
+	const kv = {
+		async get(key) { return store.get(key) || null; },
+		async put(key, value) { store.set(key, String(value)); },
+		async delete(key) { store.delete(key); },
+	};
+	const originalFetch = globalThis.fetch;
+	const requests = [];
+	globalThis.fetch = async input => {
+		const request = typeof input === 'string' ? new Request(input) : input;
+		const target = request.url;
+		const headers = new Headers(request.headers);
+		requests.push({ target, conditional: !!headers.get('If-None-Match') });
+		if (target === SRC_A && headers.get('If-None-Match') === 'stable-v1') {
+			return new Response(null, { status: 304 });
+		}
+		const node = target === SRC_A
+			? 'vless://00000000-0000-0000-0000-000000000000@1.1.1.1:443?type=tcp#stable-source'
+			: 'vless://00000000-0000-0000-0000-000000000000@2.2.2.2:443?type=tcp#changed-source';
+		return new Response(node, { status: 200, headers: { ETag: target === SRC_A ? 'stable-v2' : 'changed-v2' } });
+	};
+	try {
+		const env = { KV: kv, TOKEN: 'admin', SUBTOKEN: TOKEN };
+		const res = await worker.fetch(new Request('https://worker.example/sub?token=' + TOKEN), env, { waitUntil() {} });
+		assert.equal(res.status, 200);
+		const decoded = Buffer.from(await res.text(), 'base64').toString('utf8');
+		assert.ok(decoded.includes('stable-source'), '304 源的节点不能因部分更新而丢失');
+		assert.ok(decoded.includes('changed-source'), '变化源的节点应保留');
+		assert.ok(requests.some(r => r.target === SRC_A && r.conditional), '稳定源应先发送条件请求');
+		assert.ok(requests.some(r => r.target === SRC_A && !r.conditional), '混合结果应对稳定源去条件化重拉');
+		assert.ok(requests.some(r => r.target === SRC_B && r.conditional), '变化源应直接复用条件请求返回的内容');
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
 });
 
 await t('缓存过期+ETag 有效(304):去条件化重拉,不缓存残缺结果', async () => {
@@ -925,6 +997,60 @@ await t('协议字段校验: anytls 数字字段必须正整数 + URI 尾部斜�
 	assert.ok(cfg.includes('good_min') && cfg.includes('min-idle-session: 5'), 'anytls 正整数应保留');
 	assert.ok(cfg.includes('good_anytls'), 'anytls 正常应保留');
 	assert.ok(cfg.includes('good_slash'), '带尾部斜杠的 URI 不应被误丢');
+});
+
+await t('管理入口: save=nocn/blockwords 与正文 POST 不被错误拦截', async () => {
+	const TOKEN = '550e8400-e29b-41d4-a716-446655440000';
+	const store = new Map();
+	const kv = {
+		async get(key) { return store.get(key) || null; },
+		async put(key, value) { store.set(key, String(value)); },
+		async delete(key) { store.delete(key); },
+	};
+	const env = { KV: kv, TOKEN: 'admin', SUBTOKEN: TOKEN };
+	const ctx = { waitUntil() {} };
+	const headers = { 'User-Agent': 'Mozilla/5.0', 'Accept': 'text/html' };
+	const save = async (query, body) => worker.fetch(new Request('https://worker.example/auto?token=admin&' + query, { method: 'POST', body, headers }), env, ctx);
+	assert.equal((await save('save=nocn', '1')).status, 200, 'save=nocn 不应被入口鉴权拦截');
+	assert.equal(store.get('NOCN.txt'), '1');
+	assert.equal((await save('save=blockwords', '自定义词')).status, 200, 'save=blockwords 不应被入口鉴权拦截');
+	assert.equal(store.get('BLOCKWORDS.txt'), '自定义词');
+	assert.equal((await save('', 'vless://u@1.2.3.4:443#saved')).status, 200, '正文保存不应被入口鉴权拦截');
+	assert.ok(store.get('LINK.txt').includes('#saved'));
+});
+
+await t('刷新失败时保留旧聚合缓存,避免节点批量消失', async () => {
+	const TOKEN = '550e8400-e29b-41d4-a716-446655440000';
+	const SRC = 'https://flaky.example/sub';
+	const store = new Map([['LINK.txt', SRC]]);
+	const kv = {
+		async get(key) { return store.get(key) || null; },
+		async put(key, value) { store.set(key, String(value)); },
+		async delete(key) { store.delete(key); },
+	};
+	const originalFetch = globalThis.fetch;
+	let calls = 0;
+	globalThis.fetch = async input => {
+		const target = typeof input === 'string' ? input : input.url;
+		if (target !== SRC) throw new Error('unexpected fetch: ' + target);
+		calls++;
+		if (calls === 1) return new Response('vless://00000000-0000-0000-0000-000000000000@1.1.1.1:443?type=tcp#old-node', { status: 200 });
+		throw new Error('temporary upstream failure');
+	};
+	try {
+		const env = { KV: kv, TOKEN: 'admin', SUBTOKEN: TOKEN };
+		const request = () => new Request('https://worker.example/sub?token=' + TOKEN + '&refresh', { headers: { 'User-Agent': 'CloudSub test' } });
+		const first = await worker.fetch(request(), env, { waitUntil() {} });
+		assert.equal(first.status, 200);
+		const firstText = Buffer.from(await first.text(), 'base64').toString('utf8');
+		assert.ok(firstText.includes('old-node'));
+		const second = await worker.fetch(request(), env, { waitUntil() {} });
+		assert.equal(second.status, 200);
+		const secondText = Buffer.from(await second.text(), 'base64').toString('utf8');
+		assert.ok(secondText.includes('old-node'), '上游失败时应返回旧聚合结果');
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
 });
 
 await t('管理页保存: saveProtocol/saveNocn 均保留 URL token 参数', async () => {
