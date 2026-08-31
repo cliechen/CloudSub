@@ -511,6 +511,88 @@ await t('Clash 订阅 + 协议过滤: 只保留勾选协议节点', async () => 
 	}
 });
 
+await t('Clash 订阅: 无 UA 时 ?clash 参数也必须返回 Clash YAML(回归: 格式参数被 UA 判断吞掉)', async () => {
+	const TOKEN = '550e8400-e29b-41d4-a716-446655440000';
+	const NODES = [
+		'vless://00000000-0000-0000-0000-000000000000@1.2.3.4:443?type=tcp#vl-01',
+		'trojan://pw@8.8.8.8:443#tj-01',
+	].join('\n');
+	const store = new Map([['LINK.txt', NODES]]);
+	const kv = {
+		async get(key) { return store.get(key) || null; },
+		async put(key, value) { store.set(key, String(value)); },
+		async delete(key) { store.delete(key); },
+	};
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async () => { throw new Error('本测试不应拉取上游'); };
+	try {
+		const env = { KV: kv, TOKEN: 'admin', SUBTOKEN: TOKEN };
+		// 不带 User-Agent(handler 归一为 'null'):显式 ?clash 必须生效,不能回落成 base64
+		const res = await worker.fetch(new Request('https://worker.example/sub?token=' + TOKEN + '&clash'), env, { waitUntil() {} });
+		assert.equal(res.status, 200);
+		const text = await res.text();
+		assert.ok(text.includes('proxies:'), '无 UA + ?clash 应返回 Clash YAML,而非 base64');
+		assert.ok(text.includes('proxy-groups:'), '应含 proxy-groups 段');
+		assert.ok(text.includes('vl-01') && text.includes('tj-01'), '节点应保留');
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
+await t('Clash 订阅: subconverter 请求 + ?clash 参数仍返回 Clash YAML(回归)', async () => {
+	const TOKEN = '550e8400-e29b-41d4-a716-446655440000';
+	const store = new Map([['LINK.txt', 'trojan://pw@8.8.8.8:443#tj-01']]);
+	const kv = {
+		async get(key) { return store.get(key) || null; },
+		async put(key, value) { store.set(key, String(value)); },
+		async delete(key) { store.delete(key); },
+	};
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async () => { throw new Error('本测试不应拉取上游'); };
+	try {
+		const env = { KV: kv, TOKEN: 'admin', SUBTOKEN: TOKEN };
+		const res = await worker.fetch(new Request('https://worker.example/sub?token=' + TOKEN + '&clash', {
+			headers: { 'subconverter-request': 'subconverter', 'User-Agent': 'subconverter/1.0' },
+		}), env, { waitUntil() {} });
+		assert.equal(res.status, 200);
+		const text = await res.text();
+		assert.ok(text.includes('proxies:'), 'subconverter + ?clash 也应返回 Clash YAML');
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
+await t('Clash 订阅: 无 UA + ?clash 保留 mihomo 扩展节点(不与旧版 Clash 判定不一致)', async () => {
+	const TOKEN = '550e8400-e29b-41d4-a716-446655440000';
+	const key = Buffer.from('a'.repeat(32)).toString('base64');
+	const NODES = [
+		'hysteria2://hpw@6.6.6.6:443?sni=h.com#hy2-01',
+		'tuic://00000000-0000-0000-0000-000000000000:pw@7.7.7.7:443?sni=t.com#tuic-01',
+		'wireguard://8.8.8.8:51820?pvtkey=' + key + '&pubkey=' + key + '&ip=10.0.0.2#wg-01',
+		'vless://00000000-0000-0000-0000-000000000000@1.2.3.4:443?type=tcp#vl-01',
+	].join('\n');
+	const store = new Map([['LINK.txt', NODES]]);
+	const kv = {
+		async get(key) { return store.get(key) || null; },
+		async put(key, value) { store.set(key, String(value)); },
+		async delete(key) { store.delete(key); },
+	};
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async () => { throw new Error('本测试不应拉取上游'); };
+	try {
+		const env = { KV: kv, TOKEN: 'admin', SUBTOKEN: TOKEN };
+		const res = await worker.fetch(new Request('https://worker.example/sub?token=' + TOKEN + '&clash'), env, { waitUntil() {} });
+		assert.equal(res.status, 200);
+		const text = await res.text();
+		// 无 UA 默认按 mihomo 处理:扩展类型节点不能被旧版过滤逻辑静默剔除
+		assert.ok(text.includes('hy2-01'), 'hy2 节点应保留');
+		assert.ok(text.includes('tuic-01'), 'tuic 节点应保留');
+		assert.ok(text.includes('wg-01'), 'wireguard 节点应保留');
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
 await t('生成本地Surge配置: 输出各段落, 跳过 vless', async () => {
 	const nodes = [
 		'vless://00000000-0000-0000-0000-000000000000@1.2.3.4:443?type=tcp#vl',

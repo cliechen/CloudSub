@@ -338,16 +338,33 @@ export default {
 			if (推送通知) ctx.waitUntil(sendMessage(`#获取订阅 ${fileName}`, request.headers.get('CF-Connecting-IP'), `UA: ${userAgentHeader}</tg-spoiler>\n域名: ${url.hostname}\n<tg-spoiler>入口: ${url.pathname}</tg-spoiler>`, BotToken, ChatID, 跳过IP归属));
 			const isSubConverterRequest = request.headers.get('subconverter-request') || request.headers.get('subconverter-version') || userAgent.includes('subconverter');
 			let 订阅格式 = 'base64';
-			if (!(userAgent.includes('null') || isSubConverterRequest || userAgent.includes('nekobox') || userAgent.includes(('CloudSub').toLowerCase()))) {
-				if (userAgent.includes('sing-box') || userAgent.includes('singbox') || url.searchParams.has('sb') || url.searchParams.has('singbox')) {
+			// 显式格式参数优先于 UA 识别:?clash / ?singbox / ?surge / ?quanx / ?loon 必须无条件生效
+			// (README 契约)。此前格式参数被包在 UA 判断内,无 UA(归一为 'null')、subconverter、
+			// nekobox 等请求即使带 &clash 也会被返回 base64,导致 Clash 客户端导入时报"配置格式错误"。
+			// ?b64 / ?base64 仍保持最高优先级(显式要求 base64 时覆盖一切)。
+			if (url.searchParams.has('b64') || url.searchParams.has('base64')) {
+				订阅格式 = 'base64';
+			} else if (url.searchParams.has('clash')) {
+				订阅格式 = 'clash';
+			} else if (url.searchParams.has('singbox') || url.searchParams.has('sb')) {
+				订阅格式 = 'singbox';
+			} else if (url.searchParams.has('surge')) {
+				订阅格式 = 'surge';
+			} else if (url.searchParams.has('quanx')) {
+				订阅格式 = 'quanx';
+			} else if (url.searchParams.has('loon')) {
+				订阅格式 = 'loon';
+			} else if (!(userAgent.includes('null') || isSubConverterRequest || userAgent.includes('nekobox') || userAgent.includes(('CloudSub').toLowerCase()))) {
+				// 无显式格式参数时才按 UA 自动适配(subconverter/nekobox/无 UA 保持 base64)
+				if (userAgent.includes('sing-box') || userAgent.includes('singbox')) {
 					订阅格式 = 'singbox';
-				} else if (userAgent.includes('surge') || url.searchParams.has('surge')) {
+				} else if (userAgent.includes('surge')) {
 					订阅格式 = 'surge';
-				} else if (userAgent.includes('quantumult') || url.searchParams.has('quanx')) {
+				} else if (userAgent.includes('quantumult')) {
 					订阅格式 = 'quanx';
-				} else if (userAgent.includes('loon') || url.searchParams.has('loon')) {
+				} else if (userAgent.includes('loon')) {
 					订阅格式 = 'loon';
-				} else if (userAgent.includes('clash') || userAgent.includes('meta') || userAgent.includes('mihomo') || url.searchParams.has('clash')) {
+				} else if (userAgent.includes('clash') || userAgent.includes('meta') || userAgent.includes('mihomo')) {
 					订阅格式 = 'clash';
 				}
 			}
@@ -3124,6 +3141,10 @@ const CLASH_LEGACY_TYPES = new Set(['ss', 'ssr', 'vmess', 'vless', 'trojan', 'ht
 function isMihomoUA(ua) {
 	if (!ua) return true; // 默认按 mihomo（测试/无 UA 时保留完整功能及 emoji）
 	const s = String(ua).toLowerCase();
+	// handler 端把缺失 UA 归一为字符串 'null',此处与 isMihomoReq 保持一致按 mihomo 处理;
+	// 否则同一请求在 handler(isMihomoReq=true)与生成器(isMihomoUA=false)判定不一致,
+	// 无 UA + ?clash 会把 hy2/tuic/wireguard/reality 等节点按旧版 Clash 静默过滤掉。
+	if (s === 'null') return true;
 	// Clashoo(kenzok8/openwrt-clashoo)基于 mihomo + sing-box 双内核,支持 mihomo 全部扩展协议,按 mihomo 处理;
 	// 否则会把这些节点静默过滤掉,Clashoo 订阅缺节点。
 	if (s.includes('clashoo')) return true;

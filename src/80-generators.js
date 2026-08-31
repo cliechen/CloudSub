@@ -5,6 +5,10 @@ const CLASH_LEGACY_TYPES = new Set(['ss', 'ssr', 'vmess', 'vless', 'trojan', 'ht
 function isMihomoUA(ua) {
 	if (!ua) return true; // 默认按 mihomo（测试/无 UA 时保留完整功能及 emoji）
 	const s = String(ua).toLowerCase();
+	// handler 端把缺失 UA 归一为字符串 'null',此处与 isMihomoReq 保持一致按 mihomo 处理;
+	// 否则同一请求在 handler(isMihomoReq=true)与生成器(isMihomoUA=false)判定不一致,
+	// 无 UA + ?clash 会把 hy2/tuic/wireguard/reality 等节点按旧版 Clash 静默过滤掉。
+	if (s === 'null') return true;
 	// Clashoo(kenzok8/openwrt-clashoo)基于 mihomo + sing-box 双内核,支持 mihomo 全部扩展协议,按 mihomo 处理;
 	// 否则会把这些节点静默过滤掉,Clashoo 订阅缺节点。
 	if (s.includes('clashoo')) return true;

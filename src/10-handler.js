@@ -302,16 +302,33 @@ export default {
 			if (推送通知) ctx.waitUntil(sendMessage(`#获取订阅 ${fileName}`, request.headers.get('CF-Connecting-IP'), `UA: ${userAgentHeader}</tg-spoiler>\n域名: ${url.hostname}\n<tg-spoiler>入口: ${url.pathname}</tg-spoiler>`, BotToken, ChatID, 跳过IP归属));
 			const isSubConverterRequest = request.headers.get('subconverter-request') || request.headers.get('subconverter-version') || userAgent.includes('subconverter');
 			let 订阅格式 = 'base64';
-			if (!(userAgent.includes('null') || isSubConverterRequest || userAgent.includes('nekobox') || userAgent.includes(('CloudSub').toLowerCase()))) {
-				if (userAgent.includes('sing-box') || userAgent.includes('singbox') || url.searchParams.has('sb') || url.searchParams.has('singbox')) {
+			// 显式格式参数优先于 UA 识别:?clash / ?singbox / ?surge / ?quanx / ?loon 必须无条件生效
+			// (README 契约)。此前格式参数被包在 UA 判断内,无 UA(归一为 'null')、subconverter、
+			// nekobox 等请求即使带 &clash 也会被返回 base64,导致 Clash 客户端导入时报"配置格式错误"。
+			// ?b64 / ?base64 仍保持最高优先级(显式要求 base64 时覆盖一切)。
+			if (url.searchParams.has('b64') || url.searchParams.has('base64')) {
+				订阅格式 = 'base64';
+			} else if (url.searchParams.has('clash')) {
+				订阅格式 = 'clash';
+			} else if (url.searchParams.has('singbox') || url.searchParams.has('sb')) {
+				订阅格式 = 'singbox';
+			} else if (url.searchParams.has('surge')) {
+				订阅格式 = 'surge';
+			} else if (url.searchParams.has('quanx')) {
+				订阅格式 = 'quanx';
+			} else if (url.searchParams.has('loon')) {
+				订阅格式 = 'loon';
+			} else if (!(userAgent.includes('null') || isSubConverterRequest || userAgent.includes('nekobox') || userAgent.includes(('CloudSub').toLowerCase()))) {
+				// 无显式格式参数时才按 UA 自动适配(subconverter/nekobox/无 UA 保持 base64)
+				if (userAgent.includes('sing-box') || userAgent.includes('singbox')) {
 					订阅格式 = 'singbox';
-				} else if (userAgent.includes('surge') || url.searchParams.has('surge')) {
+				} else if (userAgent.includes('surge')) {
 					订阅格式 = 'surge';
-				} else if (userAgent.includes('quantumult') || url.searchParams.has('quanx')) {
+				} else if (userAgent.includes('quantumult')) {
 					订阅格式 = 'quanx';
-				} else if (userAgent.includes('loon') || url.searchParams.has('loon')) {
+				} else if (userAgent.includes('loon')) {
 					订阅格式 = 'loon';
-				} else if (userAgent.includes('clash') || userAgent.includes('meta') || userAgent.includes('mihomo') || url.searchParams.has('clash')) {
+				} else if (userAgent.includes('clash') || userAgent.includes('meta') || userAgent.includes('mihomo')) {
 					订阅格式 = 'clash';
 				}
 			}
