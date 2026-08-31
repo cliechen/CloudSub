@@ -721,8 +721,17 @@ async function getSUB(api, request, 追加UA, userAgentHeader, fileName = DEFAUL
 	// 重试额度:免费版单请求子请求上限为 50,每次重试(含重定向)都会额外消耗子请求,
 	// 这里限制全部源的重试总次数,避免大量源同时失败时把子请求数翻倍突破上限。
 	let 剩余重试 = Math.min(10, Math.max(2, Math.floor(api.length / 3)));
+	// Node/undici 等环境对挂起的连接可能不遵守 AbortSignal.timeout(无限阻塞),导致阶段1 的
+	// Promise.allSettled 也随之无限等待,整个订阅被拖垮(表现为订阅数偏少/卡死)。
+	// 这里用 JS 计时器为每个源的「请求 + 读取」提供硬超时兑底:到点即抛 TimeoutError,
+	// 保证任一挂起源都不会阻塞整份聚合,其余正常源照常聚合返回。
+	const 带超时 = (p, ms) => new Promise((resolve, reject) => {
+		const timer = setTimeout(() => reject(Object.assign(new Error('超时(可调大 SUBMAXTIME)'), { name: 'TimeoutError' })), ms);
+		Promise.resolve(p).then(v => { clearTimeout(timer); resolve(v); }, e => { clearTimeout(timer); reject(e); });
+	});
 	const 请求一个源 = async (apiUrl) => {
-		const 尝试 = () => getUrl(request, apiUrl, 追加UA, userAgentHeader, AbortSignal.timeout(超时), (etags && etags[apiUrl]) || null);
+		// AbortSignal.timeout 交由环境处理;JS 计时器兜底硬限时,挂起也不无限阻塞
+		const 尝试 = () => 带超时(getUrl(request, apiUrl, 追加UA, userAgentHeader, AbortSignal.timeout(超时), (etags && etags[apiUrl]) || null), 超时);
 		const 若可重试 = () => {
 			if (剩余重试 <= 0) return null;
 			剩余重试--;
@@ -812,7 +821,7 @@ async function getSUB(api, request, 追加UA, userAgentHeader, fileName = DEFAUL
 		const 尝试读取 = async (resp) => {
 			const 本次消耗 = 预算 ? { bytes: 0 } : null;
 			try {
-				return await readLimitedResponse(resp, 读取上限, 预算, 本次消耗);
+				return await 带超时(readLimitedResponse(resp, 读取上限, 预算, 本次消耗), 超时);
 			} catch (e) {
 				if (预算 && 本次消耗 && 本次消耗.bytes > 0) 预算.remaining += 本次消耗.bytes; // 归还本次读取占用的预算
 				throw e;
@@ -824,7 +833,7 @@ async function getSUB(api, request, 追加UA, userAgentHeader, fileName = DEFAUL
 			if (e && (e.name === 'AbortError' || e.name === 'TimeoutError' || e.code === 'SUB_LIMIT')) throw e;
 			await new Promise(r => setTimeout(r, 300)); // 网络级瞬时错误,短暂退避后重新拉取一次
 			释放连接(response);
-			const 重试响应 = await getUrl(request, apiUrl, 追加UA, userAgentHeader, AbortSignal.timeout(超时));
+			const 重试响应 = await 带超时(getUrl(request, apiUrl, 追加UA, userAgentHeader, AbortSignal.timeout(超时)), 超时);
 			if (!重试响应.ok) { 释放连接(重试响应); throw new Error('重试仍失败: HTTP ' + 重试响应.status); }
 			return await 尝试读取(重试响应);
 		}
