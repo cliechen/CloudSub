@@ -451,11 +451,12 @@ export default {
 			const frIpData = FRonly ? await 获取法国IP数据(env) : null;
 			const 输出结果 = FRonly ? 仅保留法国节点(过滤结果, frIpData) : 过滤结果;
 			// Clash 需区分 mihomo/旧版(legacy)以避免旧版因 hysteria2/reality 等扩展字段无法启动
-			// 仅 mihomo/meta/verge 等新核保留扩展, 旧版 Clash(含 clashoo/clashforandroid) 过滤
+			// 仅 mihomo/meta/verge 等新核保留扩展, 旧版 Clash(clashforandroid 等)过滤。
+			// 注意: Clashoo(kenzok8/openwrt-clashoo)基于 mihomo 内核,必须按 mihomo 处理,否则 hy2/tuic 等节点被静默丢弃。
 			const isMihomoReq = (() => {
 				const s = String(userAgent || '').toLowerCase();
 				if (!s || s === 'null') return true;
-				if (s.includes('clashoo')) return false;
+				if (s.includes('clashoo')) return true;
 				if (/mihomo|meta|verge|nyanpasu|stash|metaforandroid/i.test(s)) return true;
 				if (s.includes('clash')) return false;
 				return false;
@@ -516,7 +517,7 @@ export default {
 			} else if (订阅格式 == 'clash') {
 				// ===== 方案A:本地生成 Clash 配置,不依赖第三方 SUBAPI =====
 				// 分流规则优先使用 KV 缓存的 ACL4SSR 规则集,无 KV 时回退内置精简规则
-				// 兼容旧版 Clash(clashoo/premium): 非 mihomo 客户端自动过滤 hysteria2/tuic 等扩展
+				// 兼容旧版 Clash(premium): 非 mihomo 客户端自动过滤 hysteria2/tuic 等扩展(Clashoo 为 mihomo,不受影响)
 				const 本地Clash配置 = await 生成配置缓存(FMT前缀 + ':clash:' + fileName, () => 生成本地Clash配置(输出结果, env, fileName, FRonly, userAgent), 强制刷新);
 				if (!userAgent.includes('mozilla')) responseHeaders["Content-Disposition"] = `attachment; filename*=utf-8''${encodeURIComponent(fileName)}`;
 				return new Response(本地Clash配置, { headers: responseHeaders });
@@ -3099,13 +3100,15 @@ async function 获取Clash规则(env) {
 }
 
 // ===== 本地生成完整 Clash YAML =====
-// 兼容性: 旧版 Clash(clash/clash-premium/clashoo) 不支持 hysteria2/tuic/wireguard/anytls/hysteria/reality 等 mihomo 扩展
+// 兼容性: 旧版 Clash(clash/clash-premium) 不支持 hysteria2/tuic/wireguard/anytls/hysteria/reality 等 mihomo 扩展
 // 为避免此类节点导致整个配置无法启动,默认按 UA 区分: mihomo/meta/verge 保留全部, 其余仅保留通用类型
 const CLASH_LEGACY_TYPES = new Set(['ss', 'ssr', 'vmess', 'vless', 'trojan', 'http', 'https', 'socks', 'socks5', 'snell']);
 function isMihomoUA(ua) {
 	if (!ua) return true; // 默认按 mihomo（测试/无 UA 时保留完整功能及 emoji）
 	const s = String(ua).toLowerCase();
-	if (s.includes('clashoo')) return false;
+	// Clashoo(kenzok8/openwrt-clashoo)基于 mihomo + sing-box 双内核,支持 mihomo 全部扩展协议,按 mihomo 处理;
+	// 否则会把这些节点静默过滤掉,Clashoo 订阅缺节点。
+	if (s.includes('clashoo')) return true;
 	// 明确的 mihomo 系客户端才视为支持扩展类型, 否则按旧版 Clash(clash/clashforandroid) 过滤以免整配置无法启动
 	if (s.includes('mihomo') || s.includes('meta') || s.includes('verge') || s.includes('nyanpasu') || s.includes('stash') || s.includes('metaforandroid')) return true;
 	if (s.includes('clash')) return false;
@@ -3116,7 +3119,7 @@ async function 生成本地Clash配置(节点文本, env, fileName = DEFAULT_FIL
 	const proxies = [];
 	const frIndices = [];
 	const mihomo = isMihomoUA(userAgent);
-	const 法国组 = mihomo ? '🇫🇷 法国节点' : 'France'; // 旧版 clashoo 对 emoji 解析较弱, 用纯 ASCII 兼容
+	const 法国组 = mihomo ? '🇫🇷 法国节点' : 'France'; // 旧版 Clash 对 emoji 掌控较弱, 用纯 ASCII 兼容(Clashoo 为 mihomo, 不受影响)
 	for (const line of lines) {
 		let p;
 		try { p = uriToClashProxy(line); } catch (e) { p = null; } // 单节点解析失败只跳过该节点
@@ -4250,9 +4253,10 @@ function 节点去重(text) {
 
 // 法国节点名称关键词:含法国地名/拼音/英文或法语+主要法国城市/机场名称。
 // 仅匹配名称,不作为 IP 判断依据;IP 判断靠法国 CIDR 列表(更可靠)。
-// 支持: 中文/繁体/英文/法语城区、ISO 代码 FR/FRA、旗帜 emoji、主要城市(巴黎/里昂/马赛/尼斯等)、海外省卡宴。
+// 支持: 中文/繁体/英文/法语城区、ISO 代码 FR/FRA、旗帜 emoji、主要城市(巴黎/里昂/马赛/尼斯等)、海外省卡宴、
+//       主要法国机场三字码(CDG 戴高乐/ORY 奥利/NCE 尼斯/MRS 马赛/LYS 里昂/TLS 图卢兹/BOD 波尔多/NTE 南特/SXB 斯特拉斯堡)。
 // 已修正早期翻译错误: 第戎(Dijon)/戛纳(Cannes)/阿维尼翁(Avignon)/格勒诺布尔(Grenoble)/利摩日(Limoges)/兰斯(Reims)/土伦(Toulon)/布雷斯特(Brest)/敦刻尔克(Dunkirk) 等。
-const 法国地域词 = /法国|法國|法兰西|France|French|🇫🇷|\bFR\b|\bFRA\b|巴黎|Paris|里昂|Lyon|马赛|Marseille|尼斯|Nice|雷恩|Rennes|图卢兹|Toulouse|第戎|Dijon|里尔|Lille|勒阿弗尔|Le Havre|戛纳|Cannes|阿维尼翁|Avignon|波尔多|Bordeaux|南特|Nantes|斯特拉斯堡|Strasbourg|蒙彼利埃|Montpellier|南锡|Nancy|鲁昂|Rouen|土伦|Toulon|布雷斯特|Brest|格勒诺布尔|Grenoble|利摩日|Limoges|兰斯|Reims|敦刻尔克|Dunkirk|卡宴|Cayenne/i;
+const 法国地域词 = /法国|法國|法兰西|France|French|Français|🇫🇷|\bFR(?:[-_ ]?\d+)?\b|\bFRA(?:[-_ ]?\d+)?\b|巴黎|Paris|里昂|Lyon|马赛|Marseille|尼斯|Nice|雷恩|Rennes|图卢兹|Toulouse|第戎|Dijon|里尔|Lille|勒阿弗尔|Le Havre|戛纳|Cannes|阿维尼翁|Avignon|波尔多|Bordeaux|南特|Nantes|斯特拉斯堡|Strasbourg|蒙彼利埃|Montpellier|南锡|Nancy|鲁昂|Rouen|土伦|Toulon|布雷斯特|Brest|格勒诺布尔|Grenoble|利摩日|Limoges|兰斯|Reims|敦刻尔克|Dunkirk|卡宴|Cayenne|\b(?:CDG|ORY|NCE|MRS|LYS|TLS|BOD|NTE|SXB)\b/i;
 
 const 法国IP源 = [
 	// ipdeny.com: 最后更新 2026-08-26 (4732 IPv4), 需同时拉取 IPv6 文件才完整; 此为法国官方地理分配,聚合度高
@@ -4323,20 +4327,23 @@ async function 获取法国IP数据(env) {
 // 判断 IP 是否落在法国 CIDR 范围内(本质与中国 IP 二分查找同组)
 function 是法国IP(数据, ip) { return 中国IP匹配(数据, ip); }
 
-// 判断单个节点是否为法国节点:IP 优先,名称关键词回退。
-// frIpData 为空时仅走名称关键字(用于结构化配置的法国分组,零额外网络请求)。
+// 判断单个节点是否为法国节点(白名单):IP 命中 或 名称命中 任一即保留(互为兜底)。
+// 注意:法国白名单与「剔除大陆」方向相反——漏判(丢掉真实法国节点)代价远高于误收个别节点,
+// 因此不能用 IP 短路:机场许多标「法国/巴黎」的节点(尤其流媒体解锁/中转)以非法国注册的 IP 提供,
+// 仅靠 CIDR IP 会把这些真实法国节点一并漏掉;反过来法国 IP 上也有名称不含法国词的节点。故取 OR 判定。
+// frIpData 为空时仅走名称关键字(用于结构化配置的法国组,零额外网络请求)。
 function 是否法国节点(line, frIpData = null) {
 	const s = String(line || '').trim();
 	if (!s) return false;
-	// 本地 GeoIP:服务器为 IP 字面量时以 IP 归属为准(名称不可靠,机场常乱起名)
+	// 本地 GeoIP:IP 命中法国段即视为法国节点(名称不可靠,机场常乱起名)
 	if (frIpData) {
 		const host = 节点服务器地址(s);
-		if (host && 是IP字面量(host)) return 是法国IP(frIpData, host);
+		if (host && 是IP字面量(host) && 是法国IP(frIpData, host)) return true;
 	}
-	// 域名节点 / 未加载到 IP 数据:回退到名称关键词判断
+	// 名称关键词兜底(域名节点 / IP 未命中 / 未加载 IP 数据均走这里)
 	const 名 = 解析节点名(s);
-	if (!名) return false;
-	return 法国地域词.test(名);
+	if (名 && 法国地域词.test(名)) return true;
+	return false;
 }
 
 // 仅保留法国节点(白名单):用于 ?fr 法国专属订阅。空行/无法识别的节点被剔除。

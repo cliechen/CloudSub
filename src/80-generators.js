@@ -1,11 +1,13 @@
 // ===== 本地生成完整 Clash YAML =====
-// 兼容性: 旧版 Clash(clash/clash-premium/clashoo) 不支持 hysteria2/tuic/wireguard/anytls/hysteria/reality 等 mihomo 扩展
+// 兼容性: 旧版 Clash(clash/clash-premium) 不支持 hysteria2/tuic/wireguard/anytls/hysteria/reality 等 mihomo 扩展
 // 为避免此类节点导致整个配置无法启动,默认按 UA 区分: mihomo/meta/verge 保留全部, 其余仅保留通用类型
 const CLASH_LEGACY_TYPES = new Set(['ss', 'ssr', 'vmess', 'vless', 'trojan', 'http', 'https', 'socks', 'socks5', 'snell']);
 function isMihomoUA(ua) {
 	if (!ua) return true; // 默认按 mihomo（测试/无 UA 时保留完整功能及 emoji）
 	const s = String(ua).toLowerCase();
-	if (s.includes('clashoo')) return false;
+	// Clashoo(kenzok8/openwrt-clashoo)基于 mihomo + sing-box 双内核,支持 mihomo 全部扩展协议,按 mihomo 处理;
+	// 否则会把这些节点静默过滤掉,Clashoo 订阅缺节点。
+	if (s.includes('clashoo')) return true;
 	// 明确的 mihomo 系客户端才视为支持扩展类型, 否则按旧版 Clash(clash/clashforandroid) 过滤以免整配置无法启动
 	if (s.includes('mihomo') || s.includes('meta') || s.includes('verge') || s.includes('nyanpasu') || s.includes('stash') || s.includes('metaforandroid')) return true;
 	if (s.includes('clash')) return false;
@@ -16,7 +18,7 @@ async function 生成本地Clash配置(节点文本, env, fileName = DEFAULT_FIL
 	const proxies = [];
 	const frIndices = [];
 	const mihomo = isMihomoUA(userAgent);
-	const 法国组 = mihomo ? '🇫🇷 法国节点' : 'France'; // 旧版 clashoo 对 emoji 解析较弱, 用纯 ASCII 兼容
+	const 法国组 = mihomo ? '🇫🇷 法国节点' : 'France'; // 旧版 Clash 对 emoji 掌控较弱, 用纯 ASCII 兼容(Clashoo 为 mihomo, 不受影响)
 	for (const line of lines) {
 		let p;
 		try { p = uriToClashProxy(line); } catch (e) { p = null; } // 单节点解析失败只跳过该节点

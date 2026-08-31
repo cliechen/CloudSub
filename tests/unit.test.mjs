@@ -943,6 +943,28 @@ await t('仅保留法国节点: 关键词白名单仅保留法国节点,剔除�
 	assert.ok(!out.includes('Tokyo-01'), '东京节点应被剔除');
 });
 
+await t('法国判定: IP 或名称任一命中即保留(白名单 OR,避免 IP 短路漏判真实法国节点)', async () => {
+	// frIpData 只覆盖 45.0.0.0/8,节点 IP 故意设为其外,模拟机场以非法国注册 IP 托管「法国」节点
+	const data = 解析中国IP文本('45.0.0.0/8');
+	// A: 名称含法国词 + IP 不在法国段 -> 应命中(名称兑底)
+	const nameFr = 'trojan://pw@93.0.0.1:443#Paris-法国';
+	// B: 名称不含法国词 + IP 在法国段 -> 应命中(IP 兑底)
+	const ipFr = 'trojan://pw@45.5.5.5:443#不明节点-01';
+	// C: 域名节点 + 名称含机场三字码 CDG -> 应命中(域名无法查 IP,走名称)
+	const cdg = 'vless://u@fr01.example.com:443?type=tcp#CDG-巴黎';
+	// D: 名称无法国词 + IP 不在段 -> 不应命中
+	const other = 'trojan://pw@93.0.0.2:443#Tokyo-01';
+	assert.ok(是否法国节点(nameFr, data), '名称法国仍应保留(此前 IP 短路会误丢)');
+	assert.ok(是否法国节点(ipFr, data), '法国 IP 节点应保留');
+	assert.ok(是否法国节点(cdg, data), '三字码/名称应保留');
+	assert.ok(!是否法国节点(other, data), '非法国节点应剔除');
+	// ?fr 白名单整体:应保留 3 个
+	const out = 仅保留法国节点([nameFr, ipFr, cdg, other].join('\n'), data);
+	const kept = out.split('\n').filter(Boolean);
+	assert.equal(kept.length, 3, '应保留 3 个法国节点');
+	assert.ok(!out.includes('Tokyo-01'), '非法国节点应被剔除');
+});
+
 await t('生成本地Clash配置: 法国节点存在时建🇫🇷法国节点分组,FR-only/SR-only 情况不建', async () => {
 	const fr = 'vless://00000000-0000-0000-0000-000000000000@1.2.3.4:443?type=tcp#法国-巴黎';
 	const hk = 'vless://00000000-0000-0000-0000-000000000000@8.8.8.8:443?type=tcp#香港-01';

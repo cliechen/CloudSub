@@ -423,9 +423,10 @@ function 节点去重(text) {
 
 // 法国节点名称关键词:含法国地名/拼音/英文或法语+主要法国城市/机场名称。
 // 仅匹配名称,不作为 IP 判断依据;IP 判断靠法国 CIDR 列表(更可靠)。
-// 支持: 中文/繁体/英文/法语城区、ISO 代码 FR/FRA、旗帜 emoji、主要城市(巴黎/里昂/马赛/尼斯等)、海外省卡宴。
+// 支持: 中文/繁体/英文/法语城区、ISO 代码 FR/FRA、旗帜 emoji、主要城市(巴黎/里昂/马赛/尼斯等)、海外省卡宴、
+//       主要法国机场三字码(CDG 戴高乐/ORY 奥利/NCE 尼斯/MRS 马赛/LYS 里昂/TLS 图卢兹/BOD 波尔多/NTE 南特/SXB 斯特拉斯堡)。
 // 已修正早期翻译错误: 第戎(Dijon)/戛纳(Cannes)/阿维尼翁(Avignon)/格勒诺布尔(Grenoble)/利摩日(Limoges)/兰斯(Reims)/土伦(Toulon)/布雷斯特(Brest)/敦刻尔克(Dunkirk) 等。
-const 法国地域词 = /法国|法國|法兰西|France|French|🇫🇷|\bFR\b|\bFRA\b|巴黎|Paris|里昂|Lyon|马赛|Marseille|尼斯|Nice|雷恩|Rennes|图卢兹|Toulouse|第戎|Dijon|里尔|Lille|勒阿弗尔|Le Havre|戛纳|Cannes|阿维尼翁|Avignon|波尔多|Bordeaux|南特|Nantes|斯特拉斯堡|Strasbourg|蒙彼利埃|Montpellier|南锡|Nancy|鲁昂|Rouen|土伦|Toulon|布雷斯特|Brest|格勒诺布尔|Grenoble|利摩日|Limoges|兰斯|Reims|敦刻尔克|Dunkirk|卡宴|Cayenne/i;
+const 法国地域词 = /法国|法國|法兰西|France|French|Français|🇫🇷|\bFR(?:[-_ ]?\d+)?\b|\bFRA(?:[-_ ]?\d+)?\b|巴黎|Paris|里昂|Lyon|马赛|Marseille|尼斯|Nice|雷恩|Rennes|图卢兹|Toulouse|第戎|Dijon|里尔|Lille|勒阿弗尔|Le Havre|戛纳|Cannes|阿维尼翁|Avignon|波尔多|Bordeaux|南特|Nantes|斯特拉斯堡|Strasbourg|蒙彼利埃|Montpellier|南锡|Nancy|鲁昂|Rouen|土伦|Toulon|布雷斯特|Brest|格勒诺布尔|Grenoble|利摩日|Limoges|兰斯|Reims|敦刻尔克|Dunkirk|卡宴|Cayenne|\b(?:CDG|ORY|NCE|MRS|LYS|TLS|BOD|NTE|SXB)\b/i;
 
 const 法国IP源 = [
 	// ipdeny.com: 最后更新 2026-08-26 (4732 IPv4), 需同时拉取 IPv6 文件才完整; 此为法国官方地理分配,聚合度高
@@ -496,20 +497,23 @@ async function 获取法国IP数据(env) {
 // 判断 IP 是否落在法国 CIDR 范围内(本质与中国 IP 二分查找同组)
 function 是法国IP(数据, ip) { return 中国IP匹配(数据, ip); }
 
-// 判断单个节点是否为法国节点:IP 优先,名称关键词回退。
-// frIpData 为空时仅走名称关键字(用于结构化配置的法国分组,零额外网络请求)。
+// 判断单个节点是否为法国节点(白名单):IP 命中 或 名称命中 任一即保留(互为兜底)。
+// 注意:法国白名单与「剔除大陆」方向相反——漏判(丢掉真实法国节点)代价远高于误收个别节点,
+// 因此不能用 IP 短路:机场许多标「法国/巴黎」的节点(尤其流媒体解锁/中转)以非法国注册的 IP 提供,
+// 仅靠 CIDR IP 会把这些真实法国节点一并漏掉;反过来法国 IP 上也有名称不含法国词的节点。故取 OR 判定。
+// frIpData 为空时仅走名称关键字(用于结构化配置的法国组,零额外网络请求)。
 function 是否法国节点(line, frIpData = null) {
 	const s = String(line || '').trim();
 	if (!s) return false;
-	// 本地 GeoIP:服务器为 IP 字面量时以 IP 归属为准(名称不可靠,机场常乱起名)
+	// 本地 GeoIP:IP 命中法国段即视为法国节点(名称不可靠,机场常乱起名)
 	if (frIpData) {
 		const host = 节点服务器地址(s);
-		if (host && 是IP字面量(host)) return 是法国IP(frIpData, host);
+		if (host && 是IP字面量(host) && 是法国IP(frIpData, host)) return true;
 	}
-	// 域名节点 / 未加载到 IP 数据:回退到名称关键词判断
+	// 名称关键词兜底(域名节点 / IP 未命中 / 未加载 IP 数据均走这里)
 	const 名 = 解析节点名(s);
-	if (!名) return false;
-	return 法国地域词.test(名);
+	if (名 && 法国地域词.test(名)) return true;
+	return false;
 }
 
 // 仅保留法国节点(白名单):用于 ?fr 法国专属订阅。空行/无法识别的节点被剔除。

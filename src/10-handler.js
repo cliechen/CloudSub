@@ -415,11 +415,12 @@ export default {
 			const frIpData = FRonly ? await 获取法国IP数据(env) : null;
 			const 输出结果 = FRonly ? 仅保留法国节点(过滤结果, frIpData) : 过滤结果;
 			// Clash 需区分 mihomo/旧版(legacy)以避免旧版因 hysteria2/reality 等扩展字段无法启动
-			// 仅 mihomo/meta/verge 等新核保留扩展, 旧版 Clash(含 clashoo/clashforandroid) 过滤
+			// 仅 mihomo/meta/verge 等新核保留扩展, 旧版 Clash(clashforandroid 等)过滤。
+			// 注意: Clashoo(kenzok8/openwrt-clashoo)基于 mihomo 内核,必须按 mihomo 处理,否则 hy2/tuic 等节点被静默丢弃。
 			const isMihomoReq = (() => {
 				const s = String(userAgent || '').toLowerCase();
 				if (!s || s === 'null') return true;
-				if (s.includes('clashoo')) return false;
+				if (s.includes('clashoo')) return true;
 				if (/mihomo|meta|verge|nyanpasu|stash|metaforandroid/i.test(s)) return true;
 				if (s.includes('clash')) return false;
 				return false;
@@ -480,7 +481,7 @@ export default {
 			} else if (订阅格式 == 'clash') {
 				// ===== 方案A:本地生成 Clash 配置,不依赖第三方 SUBAPI =====
 				// 分流规则优先使用 KV 缓存的 ACL4SSR 规则集,无 KV 时回退内置精简规则
-				// 兼容旧版 Clash(clashoo/premium): 非 mihomo 客户端自动过滤 hysteria2/tuic 等扩展
+				// 兼容旧版 Clash(premium): 非 mihomo 客户端自动过滤 hysteria2/tuic 等扩展(Clashoo 为 mihomo,不受影响)
 				const 本地Clash配置 = await 生成配置缓存(FMT前缀 + ':clash:' + fileName, () => 生成本地Clash配置(输出结果, env, fileName, FRonly, userAgent), 强制刷新);
 				if (!userAgent.includes('mozilla')) responseHeaders["Content-Disposition"] = `attachment; filename*=utf-8''${encodeURIComponent(fileName)}`;
 				return new Response(本地Clash配置, { headers: responseHeaders });
