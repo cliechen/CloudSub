@@ -3,3 +3,6 @@ test/
 ip_Update/
 sub.png
 node_modules/
+# 本机私有订阅源清单/测试数据,含真实订阅 URL 与 token,禁止提交
+test*.txt
+.poolside/
