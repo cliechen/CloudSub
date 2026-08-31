@@ -191,6 +191,8 @@ async function getSUB(api, request, 追加UA, userAgentHeader, fileName = DEFAUL
 			释放连接(response);
 			const 重试响应 = await 带超时(getUrl(request, apiUrl, 追加UA, userAgentHeader, AbortSignal.timeout(超时)), 超时);
 			if (!重试响应.ok) { 释放连接(重试响应); throw new Error('重试仍失败: HTTP ' + 重试响应.status); }
+			// 重试响应也必须使用本源的读取上限和同一共享预算；否则重试会绕过限制，
+			// 或在共享预算不足时继续读取并造成结果不稳定。
 			return await 尝试读取(重试响应);
 		}
 	};
