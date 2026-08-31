@@ -748,7 +748,14 @@ async function getSUB(api, request, 追加UA, userAgentHeader, fileName = DEFAUL
 			const 重试请求 = 若可重试();
 			return 重试请求 ? await 重试请求 : response; // 额度耗尽则按原响应处理
 		} catch (e) {
-			if (e && (e.name === 'AbortError' || e.name === 'TimeoutError')) throw e;
+			// 超时(AbortError/TimeoutError)与网络级错误都允许重试:raw/GitHub 等源在冷启动或高峰时
+			// 常见瞬时慢到超时,若是「不重试」会直接把该源整份丢弃,订阅漏掉大量节点(实测单次可差数百行)。
+			// 每次尝试都经 带超时 硬限时且共享 剩余重试 预算全局封顶,不会无限拉长总耗时。
+			if (e && (e.name === 'AbortError' || e.name === 'TimeoutError')) {
+				const 重试请求 = 若可重试();
+				if (!重试请求) throw e;
+				return await 重试请求; // 瞬时超时重试一次(额度耗尽则放弃)
+			}
 			await new Promise(r => setTimeout(r, 500));
 			const 重试请求 = 若可重试();
 			if (!重试请求) throw e; // 重试额度耗尽,按原错误处理
